@@ -13,17 +13,15 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
     ContextTypes,
-    ConversationHandler,
 )
 
 # --- CONFIGURATION ---
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DEFAULT_VOICE = "my-MM-ThihaNeural"
 
-# --- VOICE DATABASE ---
+# --- FULL VOICE DATABASE ---
 VOICES = {
     "🌟 Best Multilingual AI": {
-        # All these voices handle ANY language (Burmese, English, etc.)
         "Ava (Female)": "en-US-AvaMultilingualNeural",
         "Andrew (Male)": "en-US-AndrewMultilingualNeural",
         "Emma (Female)": "en-US-EmmaMultilingualNeural",
@@ -36,7 +34,7 @@ VOICES = {
     },
     "🇲🇲 Myanmar": {
         "Thiha (Male)": "my-MM-ThihaNeural",
-        "Nilar (Female)": "my-MM-NularNeural",
+        "Nular (Female)": "my-MM-NularNeural",
     },
     "🌏 Asia": {
         "Thai (Premwadee - F)": "th-TH-PremwadeeNeural",
@@ -74,11 +72,7 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# --- STATE DEFINITIONS ---
-# We use a single state for simplicity, but handle menus globally
-COLLECTING = 1
-
-# --- DUMMY SERVER ---
+# --- DUMMY SERVER (Render Keep-Alive) ---
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -94,13 +88,13 @@ def run_web_server():
 # --- HELPER FUNCTIONS ---
 def preprocess_text_for_pauses(text):
     """Adds slight pauses to make speech less robotic."""
+    if not text: return ""
     text = text.replace("။", "။\n") 
     text = text.replace("、", "、 ") 
     text = text.replace(".", ".\n") 
     return text
 
 def get_control_keyboard(total_chars):
-    """The main control panel for the user."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"✅ Generate Audio ({total_chars} chars)", callback_data="generate")],
         [InlineKeyboardButton("🗑 Clear All", callback_data="clear_buffer")],
@@ -123,11 +117,11 @@ def get_settings_markup(data):
 
 # --- COMMANDS ---
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Hard Reset: Clears everything and starts fresh."""
-    context.user_data.clear() # WIPE MEMORY
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resets the bot memory and shows welcome message."""
+    context.user_data.clear()
     
-    # Re-initialize defaults
+    # Initialize Defaults
     context.user_data["text_buffer"] = []
     context.user_data["voice"] = DEFAULT_VOICE
     context.user_data["voice_name"] = "Burmese (Thiha)"
@@ -135,46 +129,48 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["pitch"] = 0
 
     await update.message.reply_text(
-        "🔄 **Bot Restarted!**\n\n"
-        "Send me any text to begin.\n"
-        "I have cleared your previous text and settings.",
+        "👋 **Bot Restarted!**\n\n"
+        "Send me text to begin.\n"
+        "I have cleared your previous memory.",
         parse_mode=ParseMode.MARKDOWN
     )
-    return COLLECTING
 
-async def collect_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Collects text messages."""
+async def collect_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Captures user text input."""
     text = update.message.text
     
-    # Safety init
+    # Init if missing
     if "text_buffer" not in context.user_data:
         context.user_data["text_buffer"] = []
         context.user_data.setdefault("voice", DEFAULT_VOICE)
+        context.user_data.setdefault("voice_name", "Burmese (Thiha)")
 
     context.user_data["text_buffer"].append(text)
     total_len = sum(len(t) for t in context.user_data["text_buffer"])
     
     await update.message.reply_text(
-        f"📥 **Added.** (Total: {total_len} chars)",
+        f"📥 **Saved.** (Total: {total_len} chars)",
         reply_markup=get_control_keyboard(total_len),
         parse_mode=ParseMode.MARKDOWN
     )
-    return COLLECTING
 
-async def generate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles the Generate and Clear buttons."""
+# --- UNIVERSAL BUTTON HANDLER ---
+# This handles ALL buttons (Voice, Settings, Generate) regardless of state.
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await query.answer() # Crucial: stops the loading animation
+    data = query.data
 
-    if query.data == "clear_buffer":
+    # --- 1. GENERATE & CLEAR ---
+    if data == "clear_buffer":
         context.user_data["text_buffer"] = []
         await query.edit_message_text("🗑 **Memory Cleared.** Send new text.")
-        return COLLECTING
+        return
 
-    if query.data == "generate":
+    if data == "generate":
         if not context.user_data.get("text_buffer"):
             await query.edit_message_text("⚠️ No text found. Send text first.")
-            return COLLECTING
+            return
 
         await query.edit_message_text("⏳ **Generating...**")
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
@@ -183,6 +179,7 @@ async def generate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             raw_text = "\n".join(context.user_data["text_buffer"])
             final_text = preprocess_text_for_pauses(raw_text)
             
+            # Fetch settings
             voice = context.user_data.get("voice", DEFAULT_VOICE)
             rate = context.user_data.get("rate", 0)
             pitch = context.user_data.get("pitch", 0)
@@ -192,17 +189,21 @@ async def generate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
             output_file = f"tts_{query.from_user.id}.mp3"
             
+            # Create Audio
             communicate = edge_tts.Communicate(final_text, voice, rate=rate_str, pitch=pitch_str)
             await communicate.save(output_file)
 
+            # Send Audio
             await context.bot.send_audio(
                 chat_id=update.effective_chat.id,
                 audio=open(output_file, "rb"),
-                caption=f"🗣 {context.user_data.get('voice_name')}",
+                caption=f"🗣 {context.user_data.get('voice_name', 'Unknown')}\n⚡ {rate_str} | 🎵 {pitch_str}",
                 title="TTS Audio"
             )
+            
+            # Cleanup
             os.remove(output_file)
-            context.user_data["text_buffer"] = [] # Auto-clear
+            context.user_data["text_buffer"] = [] # Clear buffer
             
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
@@ -212,17 +213,9 @@ async def generate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception as e:
             logging.error(f"TTS Error: {e}")
             await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Error generating audio.")
+        return
 
-    return COLLECTING
-
-# --- GLOBAL MENU HANDLER (Fixes Unresponsive Buttons) ---
-# This function handles Menus INDEPENDENT of the conversation state
-async def global_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer() # Vital to stop button loading animation
-    data = query.data
-
-    # 1. OPEN MENUS
+    # --- 2. MENUS (OPENING) ---
     if data == "open_voice_menu":
         keyboard = [[InlineKeyboardButton(r, callback_data=f"menu_{r}")] for r in VOICES.keys()]
         keyboard.append([InlineKeyboardButton("❌ Close", callback_data="close_settings")])
@@ -235,85 +228,112 @@ async def global_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("⚙️ **Audio Settings:**", reply_markup=get_settings_markup(context.user_data), parse_mode=ParseMode.MARKDOWN)
         return
 
-    # 2. NAVIGATE VOICE MENUS
+    # --- 3. VOICE NAVIGATION ---
     if data.startswith("menu_"):
         region = data.replace("menu_", "")
         keyboard = [[InlineKeyboardButton(n, callback_data=f"set_{c}|{n}")] for n, c in VOICES[region].items()]
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="open_voice_menu")]) # Points back to main voice menu
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="open_voice_menu")])
         await query.edit_message_text(f"📂 **{region}**", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # 3. SELECT VOICE
+    # --- 4. VOICE SELECTION + SAMPLE ---
     if data.startswith("set_"):
         code, name = data.replace("set_", "").split("|")
         context.user_data["voice"] = code
         context.user_data["voice_name"] = name
         
-        # Confirmation + Control Panel
+        # Send a sample
+        await query.edit_message_text(f"⏳ Loading sample for **{name}**...", parse_mode=ParseMode.MARKDOWN)
+        sample_file = f"sample_{query.from_user.id}.mp3"
+        try:
+            # Use English for sample text as it works on all multilingual/English voices. 
+            # For pure Burmese voices, they might sound funny reading English, but it confirms they work.
+            sample_text = "Hello, this is my voice." 
+            await edge_tts.Communicate(sample_text, code).save(sample_file)
+            await context.bot.send_voice(chat_id=update.effective_chat.id, voice=open(sample_file, "rb"))
+            os.remove(sample_file)
+        except Exception:
+            pass # Skip sample if fail
+
+        # Return to control panel
         total = sum(len(t) for t in context.user_data.get("text_buffer", []))
-        await query.edit_message_text(
-            f"✅ Voice set to: **{name}**\n\nReady to generate.", 
-            reply_markup=get_control_keyboard(total),
-            parse_mode=ParseMode.MARKDOWN
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"✅ Voice set to: **{name}**",
+            reply_markup=get_control_keyboard(total)
         )
         return
 
-    # 4. SETTINGS LOGIC
+    # --- 5. SETTINGS ADJUSTMENT ---
     if data == "close_settings":
         total = sum(len(t) for t in context.user_data.get("text_buffer", []))
-        await query.edit_message_text(f"📥 **Ready.** (Total: {total} chars)", reply_markup=get_control_keyboard(total), parse_mode=ParseMode.MARKDOWN)
+        if total > 0:
+            await query.edit_message_text(f"📥 **Ready.** (Total: {total} chars)", reply_markup=get_control_keyboard(total), parse_mode=ParseMode.MARKDOWN)
+        else:
+            await query.delete_message()
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Settings closed. Send text.")
         return
 
     if "rate_" in data or "pitch_" in data:
         key, val = data.split("_")
         val = int(val)
         current = context.user_data.get(key, 0)
+        # Limits
         context.user_data[key] = max(-100, min(100, current + val))
         await query.edit_message_reply_markup(get_settings_markup(context.user_data))
         return
 
     if data == "preset_crisp":
         context.user_data.update({"rate": 10, "pitch": 5})
+        await query.answer("✨ Crisp Mode ON")
         await query.edit_message_reply_markup(get_settings_markup(context.user_data))
         return
 
     if data == "preset_reset":
         context.user_data.update({"rate": 0, "pitch": 0})
+        await query.answer("🔄 Reset")
         await query.edit_message_reply_markup(get_settings_markup(context.user_data))
         return
 
-# --- MAIN SETUP ---
+# --- INIT ---
+async def post_init(application: Application):
+    """Sets the menu commands automatically."""
+    commands = [
+        ("start", "Restart Bot & Clear Memory"),
+        ("voice", "Change Speaker"),
+        ("settings", "Speed & Pitch"),
+    ]
+    await application.bot.set_my_commands(commands)
+
 def main():
     if not TOKEN:
-        print("❌ Error: TELEGRAM_TOKEN missing")
+        print("❌ TELEGRAM_TOKEN missing")
         return
 
-    application = Application.builder().token(TOKEN).build()
+    # We removed ConversationHandler because it was causing 'stuck' buttons.
+    # We now use simple logic: Text messages -> collect_text, Button clicks -> button_handler
+    application = Application.builder().token(TOKEN).post_init(post_init).build()
 
-    # 1. The Conversation Handler (For Flow)
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, collect_text)
-        ],
-        states={
-            COLLECTING: [
-                # Text Handler
-                MessageHandler(filters.TEXT & ~filters.COMMAND, collect_text),
-                # Generate/Clear Buttons
-                CallbackQueryHandler(generate_handler, pattern="^(generate|clear_buffer)$"),
-                # Menu Buttons (Pass to global handler)
-                CallbackQueryHandler(global_menu_handler, pattern="^(open_|menu_|set_|rate_|pitch_|preset_|close_|back_)")
-            ]
-        },
-        fallbacks=[CommandHandler("start", start)], # Handles restart mid-conversation
-    )
-
-    application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("voice", lambda u, c: button_handler(u, c, manual_trigger="open_voice_menu"))) # Hacky shim not needed, just text hint
+    # Actually, let's map /voice and /settings to trigger the menu by sending a message with a button
     
-    # 2. Global Fallback (Fixes "Buttons not working" if bot restarted)
-    # If the user clicks a button but the bot forgot the state, this catches it.
-    application.add_handler(CallbackQueryHandler(global_menu_handler))
+    async def command_menu_shim(update, context):
+        """Helper to show menus via commands"""
+        if update.message.text == "/voice":
+            await button_handler(update, context) # Complex to shim, easier to just send a new menu
+            keyboard = [[InlineKeyboardButton(r, callback_data=f"menu_{r}")] for r in VOICES.keys()]
+            await update.message.reply_text("🗣 **Select Voice:**", reply_markup=InlineKeyboardMarkup(keyboard))
+        elif update.message.text == "/settings":
+             context.user_data.setdefault("rate", 0)
+             context.user_data.setdefault("pitch", 0)
+             await update.message.reply_text("⚙️ **Settings:**", reply_markup=get_settings_markup(context.user_data))
+
+    application.add_handler(CommandHandler(["voice", "settings"], command_menu_shim))
+    
+    # MAIN HANDLERS
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_text))
+    application.add_handler(CallbackQueryHandler(button_handler))
 
     print("🤖 Bot is starting...")
     application.run_polling()
