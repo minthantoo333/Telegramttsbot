@@ -90,34 +90,35 @@ def run_web_server():
 
 def escape_xml(text):
     """Escapes characters that break SSML/XML."""
+    if not text: return ""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
 
 def apply_ssml_pauses(text, pause_ms):
     """
     Replaces punctuation with explicit SSML breaks.
-    If pause_ms is 0 or 'off', we don't add breaks (let engine decide).
     """
     if not text: return ""
     
-    # Escape XML chars first to prevent errors
-    text = escape_xml(text)
+    # 1. Clean the text for XML FIRST
+    safe_text = escape_xml(text)
     
     if pause_ms == 0:
-        return text
+        return safe_text
 
+    # 2. Create the break tag
     break_tag = f'<break time="{pause_ms}ms"/>'
     
-    # Replace common sentence endings with the break tag
+    # 3. Inject breaks at punctuation
     # Burmese
-    text = text.replace("။", f"။{break_tag}")
-    text = text.replace("၊", f"၊{break_tag}")
-    # English/Universal
-    text = text.replace(".", f".{break_tag}")
-    text = text.replace("!", f"!{break_tag}")
-    text = text.replace("?", f"?{break_tag}")
-    text = text.replace("\n", f"{break_tag}")
+    safe_text = safe_text.replace("။", f"။{break_tag}")
+    safe_text = safe_text.replace("၊", f"၊{break_tag}")
+    # Universal
+    safe_text = safe_text.replace(".", f".{break_tag}")
+    safe_text = safe_text.replace("!", f"!{break_tag}")
+    safe_text = safe_text.replace("?", f"?{break_tag}")
+    safe_text = safe_text.replace("\n", f"{break_tag}")
     
-    return text
+    return safe_text
 
 def split_text_smart(text, chunk_size):
     if len(text) <= chunk_size: return [text]
@@ -139,33 +140,31 @@ def split_text_smart(text, chunk_size):
 
 async def generate_long_audio_ssml(text, voice, rate_str, pitch_str, pause_ms, final_filename):
     """
-    Generates audio by wrapping chunks in SSML <prosody> and <break> tags.
+    Generates audio using simplified SSML to prevent 'reading code' errors.
     """
+    # Split text to avoid API limits
     chunks = split_text_smart(text, CHUNK_SIZE)
     merged_audio = b""
     
     for i, chunk in enumerate(chunks):
         if not chunk.strip(): continue
         
-        # 1. Apply Pause Tags to the raw text of this chunk
+        # 1. Prepare content with breaks
         ssml_content = apply_ssml_pauses(chunk, pause_ms)
         
-        # 2. Wrap in full SSML structure with Rate and Pitch
-        # We put rate/pitch inside <prosody> because Communicate(rate=...) is ignored for SSML
+        # 2. Construct Clean SSML
+        # NOTE: <voice> tag is NOT included inside. Communicate() handles it.
         final_ssml = (
             f"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>"
-            f"<voice name='{voice}'>"
             f"<prosody rate='{rate_str}' pitch='{pitch_str}'>"
             f"{ssml_content}"
             f"</prosody>"
-            f"</voice>"
             f"</speak>"
         )
 
         temp_file = f"temp_chunk_{i}_{final_filename}"
         try:
-            # Note: We do NOT pass rate/pitch to Communicate here, it's already in the SSML
-            communicate = edge_tts.Communicate(final_ssml, voice) 
+            communicate = edge_tts.Communicate(final_ssml, voice)
             await communicate.save(temp_file)
             
             with open(temp_file, "rb") as f:
@@ -203,7 +202,7 @@ def get_settings_markup(data):
         [InlineKeyboardButton(f"🔉 Lower", callback_data="pitch_-5"),
          InlineKeyboardButton(f"🔊 Higher ({pitch}Hz)", callback_data="pitch_+5")],
         
-        # NEW PAUSE ROW
+        # PAUSE ROW
         [InlineKeyboardButton(f"⏱ Pause: {pause_text}", callback_data="cycle_pause")],
 
         [InlineKeyboardButton("✨ Crisp & Clear", callback_data="preset_crisp")],
@@ -361,11 +360,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Check if user already provided their own SSML
             if raw_text.strip().startswith("<speak>"):
-                # If user manually typed SSML, we just send it as is
                 await edge_tts.Communicate(raw_text, voice).save(output_file)
                 caption = f"🗣 {context.user_data.get('voice_name')}\n(Manual SSML)"
             else:
-                # Use our new SSML generator
                 success = await generate_long_audio_ssml(
                     raw_text, voice, rate_str, pitch_str, pause, output_file
                 )
