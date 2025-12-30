@@ -198,7 +198,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["text_buffer"] = []
     context.user_data["voice"] = DEFAULT_VOICE
     context.user_data["voice_name"] = "Burmese (Thiha)"
-    await update.message.reply_text("👋 **Bot Restarted!**\n\nSend me text to begin.", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("👋 **Bot Restarted!**\n\nSend me text or a .txt file to begin.", parse_mode=ParseMode.MARKDOWN)
 
 async def command_voice(update, context): await show_voice_menu(update, context, True)
 async def command_settings(update, context): await show_settings_menu(update, context, True)
@@ -215,6 +215,49 @@ async def collect_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"📥 **Saved.** (Total: {total_len} chars)",
+        reply_markup=get_control_keyboard(total_len),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# --- NEW: TXT FILE HANDLER ---
+async def handle_txt_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file = await update.message.document.get_file()
+    
+    # Check file size (Telegram bot API limit is 20MB for download)
+    if update.message.document.file_size > 5 * 1024 * 1024:  # Limit to 5MB for safety
+        await update.message.reply_text("⚠️ File too large. Please send files smaller than 5MB.")
+        return
+
+    # Download file to memory
+    file_bytes = await file.download_as_bytearray()
+    
+    try:
+        # Try decoding as UTF-8
+        text_content = file_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        try:
+            # Fallback for Windows ANSI/other encodings if UTF-8 fails
+            text_content = file_bytes.decode('cp1252')
+        except:
+            await update.message.reply_text("⚠️ Could not decode file. Please ensure it is UTF-8 encoded text.")
+            return
+
+    if not text_content.strip():
+        await update.message.reply_text("⚠️ File appears to be empty.")
+        return
+
+    # Initialize buffer if needed
+    if "text_buffer" not in context.user_data:
+        context.user_data["text_buffer"] = []
+        context.user_data.setdefault("voice", DEFAULT_VOICE)
+        context.user_data.setdefault("voice_name", "Burmese (Thiha)")
+
+    # Append text
+    context.user_data["text_buffer"].append(text_content)
+    total_len = sum(len(t) for t in context.user_data["text_buffer"])
+
+    await update.message.reply_text(
+        f"📄 **File Read Successfully!**\nAdded {len(text_content)} chars.\n\n📥 **Total Buffer:** {total_len} chars",
         reply_markup=get_control_keyboard(total_len),
         parse_mode=ParseMode.MARKDOWN
     )
@@ -336,11 +379,20 @@ async def post_init(application: Application):
 def main():
     if not TOKEN: print("❌ TELEGRAM_TOKEN missing"); return
     application = Application.builder().token(TOKEN).post_init(post_init).build()
+    
+    # HANDLERS
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("voice", command_voice))
     application.add_handler(CommandHandler("settings", command_settings))
+    
+    # Text handler (for normal messages)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_text))
+    
+    # NEW: File handler (Accepts only .txt files)
+    application.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_txt_file))
+    
     application.add_handler(CallbackQueryHandler(button_handler))
+    
     print("🤖 Bot is starting...")
     application.run_polling()
 
