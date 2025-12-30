@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+import html  # Added for XML escaping
 import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import edge_tts
@@ -18,7 +19,7 @@ from telegram.ext import (
 # --- CONFIGURATION ---
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DEFAULT_VOICE = "my-MM-ThihaNeural"
-CHUNK_SIZE = 2500  # Split text every 2500 chars to prevent crashes
+CHUNK_SIZE = 2500
 
 # --- FULL VOICE DATABASE ---
 VOICES = {
@@ -73,7 +74,7 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# --- DUMMY SERVER (Render Keep-Alive) ---
+# --- DUMMY SERVER ---
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -83,50 +84,64 @@ class SimpleHandler(BaseHTTPRequestHandler):
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), SimpleHandler)
-    print(f"🌍 Web server listening on port {port}")
     server.serve_forever()
 
 # --- HELPER FUNCTIONS ---
 def preprocess_text_for_pauses(text):
+    """Basic preprocessing for plain text mode."""
     if not text: return ""
     text = text.replace("။", "။\n") 
     text = text.replace("、", "、 ") 
     text = text.replace(".", ".\n") 
     return text
 
-def split_text_smart(text, chunk_size):
-    """Splits text into chunks, trying to break at newlines/periods."""
-    if len(text) <= chunk_size:
-        return [text]
+def apply_ssml_formatting(text, pause_ms):
+    """Converts plain text to SSML with adjustable pauses."""
+    if pause_ms <= 0:
+        return preprocess_text_for_pauses(text)
     
+    # Escape XML special characters to prevent SSML errors
+    safe_text = html.escape(text)
+    
+    # Insert break tags at punctuation
+    # We add the break AFTER the punctuation
+    break_tag = f' <break time="{pause_ms}ms"/> '
+    
+    replacements = {
+        ".": "." + break_tag,
+        "?": "?" + break_tag,
+        "!": "!" + break_tag,
+        "။": "။" + break_tag,
+        "\n": "\n" + break_tag
+    }
+    
+    for char, replacement in replacements.items():
+        safe_text = safe_text.replace(char, replacement)
+        
+    # Wrap in speak tag for edge-tts to recognize as SSML
+    return f"<speak>{safe_text}</speak>"
+
+def split_text_smart(text, chunk_size):
+    if len(text) <= chunk_size: return [text]
     chunks = []
     while text:
         if len(text) <= chunk_size:
             chunks.append(text)
             break
-        
-        # Try to find a safe break point (newline or period) within the limit
         split_at = -1
-        # Check last newline
         newline_pos = text.rfind('\n', 0, chunk_size)
-        if newline_pos != -1:
-            split_at = newline_pos + 1
+        if newline_pos != -1: split_at = newline_pos + 1
         else:
-            # Check last period if no newline
             period_pos = text.rfind('.', 0, chunk_size)
-            if period_pos != -1:
-                split_at = period_pos + 1
-            else:
-                # Force split if no punctuation
-                split_at = chunk_size
-        
+            if period_pos != -1: split_at = period_pos + 1
+            else: split_at = chunk_size
         chunks.append(text[:split_at])
         text = text[split_at:]
-    
     return chunks
 
-async def generate_long_audio(text, voice, rate_str, pitch_str, final_filename):
-    """Generates audio in chunks and merges them."""
+async def generate_long_audio(text, voice, rate_str, pitch_str, pause_ms, final_filename):
+    """Generates audio in chunks."""
+    # Split raw text first (before SSML conversion) to keep chunks clean
     chunks = split_text_smart(text, CHUNK_SIZE)
     merged_audio = b""
     
@@ -134,21 +149,26 @@ async def generate_long_audio(text, voice, rate_str, pitch_str, final_filename):
         if not chunk.strip(): continue
         
         temp_file = f"temp_chunk_{i}_{final_filename}"
+        
+        # Apply SSML or Preprocessing per chunk
+        if pause_ms > 0:
+            # SSML Mode
+            final_chunk_text = apply_ssml_formatting(chunk, pause_ms)
+        else:
+            # Plain Text Mode
+            final_chunk_text = preprocess_text_for_pauses(chunk)
+
         try:
-            communicate = edge_tts.Communicate(chunk, voice, rate=rate_str, pitch=pitch_str)
+            communicate = edge_tts.Communicate(final_chunk_text, voice, rate=rate_str, pitch=pitch_str)
             await communicate.save(temp_file)
-            
-            # Read binary and append
             with open(temp_file, "rb") as f:
                 merged_audio += f.read()
-            
             os.remove(temp_file)
         except Exception as e:
             logging.error(f"Chunk error: {e}")
             if os.path.exists(temp_file): os.remove(temp_file)
             return False
 
-    # Save merged file
     with open(final_filename, "wb") as f:
         f.write(merged_audio)
     return True
@@ -165,12 +185,19 @@ def get_control_keyboard(total_chars):
 def get_settings_markup(data):
     speed = data.get("rate", 0)
     pitch = data.get("pitch", 0)
+    pause = data.get("pause", 0)
     return InlineKeyboardMarkup([
+        # Speed Row
         [InlineKeyboardButton(f"🐢 Slower", callback_data="rate_-10"),
          InlineKeyboardButton(f"🚀 Faster ({speed}%)", callback_data="rate_+10")],
+        # Pitch Row
         [InlineKeyboardButton(f"🔉 Lower", callback_data="pitch_-5"),
          InlineKeyboardButton(f"🔊 Higher ({pitch}Hz)", callback_data="pitch_+5")],
-        [InlineKeyboardButton("✨ Crisp & Clear", callback_data="preset_crisp")],
+        # NEW: Pause Row
+        [InlineKeyboardButton(f"➖ Less Pause", callback_data="pause_-100"),
+         InlineKeyboardButton(f"⏸️ Pause ({pause}ms)", callback_data="pause_+100")],
+        
+        [InlineKeyboardButton("✨ Crisp", callback_data="preset_crisp")],
         [InlineKeyboardButton("🔄 Reset", callback_data="preset_reset")],
         [InlineKeyboardButton("✅ Close Settings", callback_data="close_settings")]
     ])
@@ -187,8 +214,9 @@ async def show_voice_menu(update, context, is_new_message=False):
 async def show_settings_menu(update, context, is_new_message=False):
     context.user_data.setdefault("rate", 0)
     context.user_data.setdefault("pitch", 0)
+    context.user_data.setdefault("pause", 0) # Initialize pause
     markup = get_settings_markup(context.user_data)
-    text = "⚙️ **Audio Settings:**"
+    text = "⚙️ **Audio Settings:**\n\n*Pause adds silence between sentences.*"
     if is_new_message: await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
     else: await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
 
@@ -219,45 +247,30 @@ async def collect_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN
     )
 
-# --- NEW: TXT FILE HANDLER ---
 async def handle_txt_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await update.message.document.get_file()
-    
-    # Check file size (Telegram bot API limit is 20MB for download)
-    if update.message.document.file_size > 5 * 1024 * 1024:  # Limit to 5MB for safety
-        await update.message.reply_text("⚠️ File too large. Please send files smaller than 5MB.")
+    if update.message.document.file_size > 5 * 1024 * 1024:
+        await update.message.reply_text("⚠️ File too large. Max 5MB.")
         return
 
-    # Download file to memory
     file_bytes = await file.download_as_bytearray()
-    
-    try:
-        # Try decoding as UTF-8
-        text_content = file_bytes.decode('utf-8')
+    try: text_content = file_bytes.decode('utf-8')
     except UnicodeDecodeError:
-        try:
-            # Fallback for Windows ANSI/other encodings if UTF-8 fails
-            text_content = file_bytes.decode('cp1252')
-        except:
-            await update.message.reply_text("⚠️ Could not decode file. Please ensure it is UTF-8 encoded text.")
-            return
+        try: text_content = file_bytes.decode('cp1252')
+        except: await update.message.reply_text("⚠️ Decode error."); return
 
-    if not text_content.strip():
-        await update.message.reply_text("⚠️ File appears to be empty.")
-        return
+    if not text_content.strip(): await update.message.reply_text("⚠️ Empty file."); return
 
-    # Initialize buffer if needed
     if "text_buffer" not in context.user_data:
         context.user_data["text_buffer"] = []
         context.user_data.setdefault("voice", DEFAULT_VOICE)
         context.user_data.setdefault("voice_name", "Burmese (Thiha)")
 
-    # Append text
     context.user_data["text_buffer"].append(text_content)
     total_len = sum(len(t) for t in context.user_data["text_buffer"])
 
     await update.message.reply_text(
-        f"📄 **File Read Successfully!**\nAdded {len(text_content)} chars.\n\n📥 **Total Buffer:** {total_len} chars",
+        f"📄 **File Read!** (+{len(text_content)} chars)\n📥 **Total:** {total_len}",
         reply_markup=get_control_keyboard(total_len),
         parse_mode=ParseMode.MARKDOWN
     )
@@ -272,7 +285,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "clear_buffer":
         context.user_data["text_buffer"] = []
-        await query.edit_message_text("🗑 **Memory Cleared.** Send new text.")
+        await query.edit_message_text("🗑 **Memory Cleared.**")
         return
 
     if data == "generate":
@@ -280,7 +293,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ No text found.")
             return
 
-        await query.edit_message_text("⏳ **Generating...** (Splitting large text)")
+        await query.edit_message_text("⏳ **Generating...**")
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
 
         try:
@@ -288,26 +301,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             voice = context.user_data.get("voice", DEFAULT_VOICE)
             output_file = f"tts_{query.from_user.id}.mp3"
             
-            # SSML Check
+            # SETTINGS extraction
+            rate = context.user_data.get("rate", 0)
+            pitch = context.user_data.get("pitch", 0)
+            pause = context.user_data.get("pause", 0) # ms
+            
+            rate_str = f"+{rate}%" if rate >= 0 else f"{rate}%"
+            pitch_str = f"+{pitch}Hz" if pitch >= 0 else f"{pitch}Hz"
+            
+            # Check for existing SSML
             if raw_text.strip().startswith("<speak>"):
+                # If user manually sent SSML, ignore auto-pause settings
                 await edge_tts.Communicate(raw_text, voice).save(output_file)
-                caption = f"🗣 {context.user_data.get('voice_name')}\n(SSML)"
+                caption = f"🗣 {context.user_data.get('voice_name')}\n(Manual SSML)"
             else:
-                final_text = preprocess_text_for_pauses(raw_text)
-                rate, pitch = context.user_data.get("rate", 0), context.user_data.get("pitch", 0)
-                rate_str = f"+{rate}%" if rate >= 0 else f"{rate}%"
-                pitch_str = f"+{pitch}Hz" if pitch >= 0 else f"{pitch}Hz"
-                
-                # USE SMART LONG GENERATOR
-                success = await generate_long_audio(final_text, voice, rate_str, pitch_str, output_file)
-                if not success: raise Exception("Chunk generation failed")
-                caption = f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str}"
+                success = await generate_long_audio(raw_text, voice, rate_str, pitch_str, pause, output_file)
+                if not success: raise Exception("Generation failed")
+                caption = f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏸️ {pause}ms"
 
             await context.bot.send_audio(
                 chat_id=update.effective_chat.id,
                 audio=open(output_file, "rb"),
-                caption=caption,
-                title="TTS Audio"
+                caption=caption
             )
             os.remove(output_file)
             context.user_data["text_buffer"] = []
@@ -315,7 +330,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             logging.error(f"TTS Error: {e}")
-            await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Error generating audio.")
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"⚠️ Error: {str(e)}")
         return
 
     # VOICE NAVIGATION
@@ -326,18 +341,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"📂 **{region}**", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # VOICE SELECTION + DUAL LANG SAMPLE
     if data.startswith("set_"):
         code, name = data.replace("set_", "").split("|")
         context.user_data["voice"] = code
         context.user_data["voice_name"] = name
         
-        await query.edit_message_text(f"⏳ Loading sample for **{name}**...", parse_mode=ParseMode.MARKDOWN)
-        sample_file = f"sample_{query.from_user.id}.mp3"
+        # Play sample
         try:
-            # DUAL LANGUAGE TEXT
-            sample_text = "မင်္ဂလာပါ။ (Mingalabar). Hello, this is a test."
-            await edge_tts.Communicate(sample_text, code).save(sample_file)
+            sample_file = f"sample_{query.from_user.id}.mp3"
+            await edge_tts.Communicate("Hello.", code).save(sample_file)
             await context.bot.send_voice(chat_id=update.effective_chat.id, voice=open(sample_file, "rb"))
             os.remove(sample_file)
         except: pass
@@ -345,52 +357,55 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = sum(len(t) for t in context.user_data.get("text_buffer", []))
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=f"✅ Voice set to: **{name}**",
+            text=f"✅ Voice: **{name}**",
             reply_markup=get_control_keyboard(total)
         )
         return
 
-    # SETTINGS
+    # SETTINGS LOGIC
     if data == "close_settings":
         total = sum(len(t) for t in context.user_data.get("text_buffer", []))
-        if total > 0: await query.edit_message_text(f"📥 **Ready.** (Total: {total} chars)", reply_markup=get_control_keyboard(total), parse_mode=ParseMode.MARKDOWN)
-        else: await query.delete_message(); await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Settings closed.")
+        if total > 0: await query.edit_message_text(f"📥 **Ready.**", reply_markup=get_control_keyboard(total))
+        else: await query.delete_message()
         return
 
-    if "rate_" in data or "pitch_" in data:
+    if "rate_" in data or "pitch_" in data or "pause_" in data:
         key, val = data.split("_")
-        context.user_data[key] = max(-100, min(100, context.user_data.get(key, 0) + int(val)))
+        current_val = context.user_data.get(key, 0)
+        
+        if key == "pause":
+            # Pause limit: 0ms to 5000ms (5 seconds)
+            new_val = max(0, min(5000, current_val + int(val)))
+        else:
+            # Rate/Pitch limit: -100 to 100
+            new_val = max(-100, min(100, current_val + int(val)))
+            
+        context.user_data[key] = new_val
         await query.edit_message_reply_markup(get_settings_markup(context.user_data))
         return
 
     if data == "preset_crisp":
-        context.user_data.update({"rate": 10, "pitch": 5})
+        context.user_data.update({"rate": 10, "pitch": 5, "pause": 0})
         await query.edit_message_reply_markup(get_settings_markup(context.user_data))
         return
 
     if data == "preset_reset":
-        context.user_data.update({"rate": 0, "pitch": 0})
+        context.user_data.update({"rate": 0, "pitch": 0, "pause": 0})
         await query.edit_message_reply_markup(get_settings_markup(context.user_data))
         return
 
 async def post_init(application: Application):
-    await application.bot.set_my_commands([("start", "Restart"), ("voice", "Change Speaker"), ("settings", "Settings")])
+    await application.bot.set_my_commands([("start", "Restart"), ("voice", "Voice"), ("settings", "Settings")])
 
 def main():
     if not TOKEN: print("❌ TELEGRAM_TOKEN missing"); return
     application = Application.builder().token(TOKEN).post_init(post_init).build()
     
-    # HANDLERS
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("voice", command_voice))
     application.add_handler(CommandHandler("settings", command_settings))
-    
-    # Text handler (for normal messages)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_text))
-    
-    # NEW: File handler (Accepts only .txt files)
     application.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_txt_file))
-    
     application.add_handler(CallbackQueryHandler(button_handler))
     
     print("🤖 Bot is starting...")
