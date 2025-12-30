@@ -4,7 +4,7 @@ import threading
 import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import edge_tts
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     Application,
@@ -91,6 +91,7 @@ def run_web_server():
 def escape_xml(text):
     """Escapes characters that break SSML/XML."""
     if not text: return ""
+    # Only escape necessary XML characters.
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
 
 def apply_ssml_pauses(text, pause_ms):
@@ -99,7 +100,7 @@ def apply_ssml_pauses(text, pause_ms):
     """
     if not text: return ""
     
-    # 1. Clean the text for XML FIRST
+    # 1. Clean the text for XML FIRST (Prevents existing < > from breaking code)
     safe_text = escape_xml(text)
     
     if pause_ms == 0:
@@ -109,14 +110,12 @@ def apply_ssml_pauses(text, pause_ms):
     break_tag = f'<break time="{pause_ms}ms"/>'
     
     # 3. Inject breaks at punctuation
-    # Burmese
     safe_text = safe_text.replace("။", f"။{break_tag}")
     safe_text = safe_text.replace("၊", f"၊{break_tag}")
-    # Universal
     safe_text = safe_text.replace(".", f".{break_tag}")
     safe_text = safe_text.replace("!", f"!{break_tag}")
     safe_text = safe_text.replace("?", f"?{break_tag}")
-    safe_text = safe_text.replace("\n", f"{break_tag}")
+    safe_text = safe_text.replace("\n", f"\n{break_tag}")
     
     return safe_text
 
@@ -140,9 +139,8 @@ def split_text_smart(text, chunk_size):
 
 async def generate_long_audio_ssml(text, voice, rate_str, pitch_str, pause_ms, final_filename):
     """
-    Generates audio using simplified SSML to prevent 'reading code' errors.
+    Generates audio using strict single-line SSML to prevent 'reading code' errors.
     """
-    # Split text to avoid API limits
     chunks = split_text_smart(text, CHUNK_SIZE)
     merged_audio = b""
     
@@ -152,15 +150,20 @@ async def generate_long_audio_ssml(text, voice, rate_str, pitch_str, pause_ms, f
         # 1. Prepare content with breaks
         ssml_content = apply_ssml_pauses(chunk, pause_ms)
         
-        # 2. Construct Clean SSML
-        # NOTE: <voice> tag is NOT included inside. Communicate() handles it.
+        # 2. Construct Clean SSML (SINGLE LINE IS CRITICAL)
+        # We include the voice tag inside to be safe, but ensure NO NEWLINES.
         final_ssml = (
             f"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>"
+            f"<voice name='{voice}'>"
             f"<prosody rate='{rate_str}' pitch='{pitch_str}'>"
             f"{ssml_content}"
             f"</prosody>"
+            f"</voice>"
             f"</speak>"
         )
+
+        # 3. Strip whitespace - if it doesn't start with <speak>, TTS reads the code.
+        final_ssml = final_ssml.strip()
 
         temp_file = f"temp_chunk_{i}_{final_filename}"
         try:
@@ -222,7 +225,7 @@ async def show_voice_menu(update, context, is_new_message=False):
 async def show_settings_menu(update, context, is_new_message=False):
     context.user_data.setdefault("rate", 0)
     context.user_data.setdefault("pitch", 0)
-    context.user_data.setdefault("pause", 500) # Default 500ms
+    context.user_data.setdefault("pause", 500)
     markup = get_settings_markup(context.user_data)
     text = "⚙️ **Audio Settings:**\n\n_Note: 'Pause' adds silence after every sentence._"
     if is_new_message: await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
@@ -304,9 +307,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "cycle_pause":
-        # Cycle: 500 -> 1000 -> 0 (Off) -> 100 -> 200 -> 300 -> 400 -> 500
         current = context.user_data.get("pause", 500)
-        
+        # Cycle: 500 -> 1000 -> 0 -> 100 -> 200 -> 300 -> 400 -> 500
         if current == 500: new_pause = 1000
         elif current == 1000: new_pause = 0
         elif current == 0: new_pause = 100
@@ -314,7 +316,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif current == 200: new_pause = 300
         elif current == 300: new_pause = 400
         else: new_pause = 500
-        
         context.user_data["pause"] = new_pause
         await query.edit_message_reply_markup(get_settings_markup(context.user_data))
         return
@@ -341,7 +342,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ No text found.")
             return
 
-        await query.edit_message_text("⏳ **Generating...** (Applying SSML Pauses)")
+        await query.edit_message_text("⏳ **Generating...**")
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
 
         try:
@@ -349,12 +350,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             voice = context.user_data.get("voice", DEFAULT_VOICE)
             output_file = f"tts_{query.from_user.id}.mp3"
             
-            # User Settings
             rate = context.user_data.get("rate", 0)
             pitch = context.user_data.get("pitch", 0)
             pause = context.user_data.get("pause", 500)
             
-            # Format Rate/Pitch for SSML
             rate_str = f"+{rate}%" if rate >= 0 else f"{rate}%"
             pitch_str = f"+{pitch}Hz" if pitch >= 0 else f"{pitch}Hz"
 
