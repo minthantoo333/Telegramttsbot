@@ -89,9 +89,9 @@ def run_web_server():
 # --- HELPER FUNCTIONS ---
 def preprocess_text_for_pauses(text):
     if not text: return ""
-    text = text.replace("။", "။\n") 
+    text = text.replace("။", "။ ") 
     text = text.replace("、", "、 ") 
-    text = text.replace(".", ".\n") 
+    text = text.replace(".", ". ")  
     return text
 
 def split_text_smart(text, chunk_size):
