@@ -1,7 +1,6 @@
 import os
 import logging
 import threading
-import html  # Added for XML escaping
 import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import edge_tts
@@ -19,7 +18,7 @@ from telegram.ext import (
 # --- CONFIGURATION ---
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DEFAULT_VOICE = "my-MM-ThihaNeural"
-CHUNK_SIZE = 2500
+CHUNK_SIZE = 2500  
 
 # --- FULL VOICE DATABASE ---
 VOICES = {
@@ -84,42 +83,41 @@ class SimpleHandler(BaseHTTPRequestHandler):
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), SimpleHandler)
+    print(f"🌍 Web server listening on port {port}")
     server.serve_forever()
 
 # --- HELPER FUNCTIONS ---
-def preprocess_text_for_pauses(text):
-    """Basic preprocessing for plain text mode."""
-    if not text: return ""
-    text = text.replace("။", "။\n") 
-    text = text.replace("、", "、 ") 
-    text = text.replace(".", ".\n") 
-    return text
 
-def apply_ssml_formatting(text, pause_ms):
-    """Converts plain text to SSML with adjustable pauses."""
-    if pause_ms <= 0:
-        return preprocess_text_for_pauses(text)
+def escape_xml(text):
+    """Escapes characters that break SSML/XML."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
+
+def apply_ssml_pauses(text, pause_ms):
+    """
+    Replaces punctuation with explicit SSML breaks.
+    If pause_ms is 0 or 'off', we don't add breaks (let engine decide).
+    """
+    if not text: return ""
     
-    # Escape XML special characters to prevent SSML errors
-    safe_text = html.escape(text)
+    # Escape XML chars first to prevent errors
+    text = escape_xml(text)
     
-    # Insert break tags at punctuation
-    # We add the break AFTER the punctuation
-    break_tag = f' <break time="{pause_ms}ms"/> '
+    if pause_ms == 0:
+        return text
+
+    break_tag = f'<break time="{pause_ms}ms"/>'
     
-    replacements = {
-        ".": "." + break_tag,
-        "?": "?" + break_tag,
-        "!": "!" + break_tag,
-        "။": "။" + break_tag,
-        "\n": "\n" + break_tag
-    }
+    # Replace common sentence endings with the break tag
+    # Burmese
+    text = text.replace("။", f"။{break_tag}")
+    text = text.replace("၊", f"၊{break_tag}")
+    # English/Universal
+    text = text.replace(".", f".{break_tag}")
+    text = text.replace("!", f"!{break_tag}")
+    text = text.replace("?", f"?{break_tag}")
+    text = text.replace("\n", f"{break_tag}")
     
-    for char, replacement in replacements.items():
-        safe_text = safe_text.replace(char, replacement)
-        
-    # Wrap in speak tag for edge-tts to recognize as SSML
-    return f"<speak>{safe_text}</speak>"
+    return text
 
 def split_text_smart(text, chunk_size):
     if len(text) <= chunk_size: return [text]
@@ -139,28 +137,37 @@ def split_text_smart(text, chunk_size):
         text = text[split_at:]
     return chunks
 
-async def generate_long_audio(text, voice, rate_str, pitch_str, pause_ms, final_filename):
-    """Generates audio in chunks."""
-    # Split raw text first (before SSML conversion) to keep chunks clean
+async def generate_long_audio_ssml(text, voice, rate_str, pitch_str, pause_ms, final_filename):
+    """
+    Generates audio by wrapping chunks in SSML <prosody> and <break> tags.
+    """
     chunks = split_text_smart(text, CHUNK_SIZE)
     merged_audio = b""
     
     for i, chunk in enumerate(chunks):
         if not chunk.strip(): continue
         
-        temp_file = f"temp_chunk_{i}_{final_filename}"
+        # 1. Apply Pause Tags to the raw text of this chunk
+        ssml_content = apply_ssml_pauses(chunk, pause_ms)
         
-        # Apply SSML or Preprocessing per chunk
-        if pause_ms > 0:
-            # SSML Mode
-            final_chunk_text = apply_ssml_formatting(chunk, pause_ms)
-        else:
-            # Plain Text Mode
-            final_chunk_text = preprocess_text_for_pauses(chunk)
+        # 2. Wrap in full SSML structure with Rate and Pitch
+        # We put rate/pitch inside <prosody> because Communicate(rate=...) is ignored for SSML
+        final_ssml = (
+            f"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>"
+            f"<voice name='{voice}'>"
+            f"<prosody rate='{rate_str}' pitch='{pitch_str}'>"
+            f"{ssml_content}"
+            f"</prosody>"
+            f"</voice>"
+            f"</speak>"
+        )
 
+        temp_file = f"temp_chunk_{i}_{final_filename}"
         try:
-            communicate = edge_tts.Communicate(final_chunk_text, voice, rate=rate_str, pitch=pitch_str)
+            # Note: We do NOT pass rate/pitch to Communicate here, it's already in the SSML
+            communicate = edge_tts.Communicate(final_ssml, voice) 
             await communicate.save(temp_file)
+            
             with open(temp_file, "rb") as f:
                 merged_audio += f.read()
             os.remove(temp_file)
@@ -185,19 +192,21 @@ def get_control_keyboard(total_chars):
 def get_settings_markup(data):
     speed = data.get("rate", 0)
     pitch = data.get("pitch", 0)
-    pause = data.get("pause", 0)
+    pause = data.get("pause", 500) # Default 500ms
+    
+    pause_text = "Off" if pause == 0 else f"{pause}ms"
+
     return InlineKeyboardMarkup([
-        # Speed Row
         [InlineKeyboardButton(f"🐢 Slower", callback_data="rate_-10"),
          InlineKeyboardButton(f"🚀 Faster ({speed}%)", callback_data="rate_+10")],
-        # Pitch Row
+        
         [InlineKeyboardButton(f"🔉 Lower", callback_data="pitch_-5"),
          InlineKeyboardButton(f"🔊 Higher ({pitch}Hz)", callback_data="pitch_+5")],
-        # NEW: Pause Row
-        [InlineKeyboardButton(f"➖ Less Pause", callback_data="pause_-100"),
-         InlineKeyboardButton(f"⏸️ Pause ({pause}ms)", callback_data="pause_+100")],
         
-        [InlineKeyboardButton("✨ Crisp", callback_data="preset_crisp")],
+        # NEW PAUSE ROW
+        [InlineKeyboardButton(f"⏱ Pause: {pause_text}", callback_data="cycle_pause")],
+
+        [InlineKeyboardButton("✨ Crisp & Clear", callback_data="preset_crisp")],
         [InlineKeyboardButton("🔄 Reset", callback_data="preset_reset")],
         [InlineKeyboardButton("✅ Close Settings", callback_data="close_settings")]
     ])
@@ -214,9 +223,9 @@ async def show_voice_menu(update, context, is_new_message=False):
 async def show_settings_menu(update, context, is_new_message=False):
     context.user_data.setdefault("rate", 0)
     context.user_data.setdefault("pitch", 0)
-    context.user_data.setdefault("pause", 0) # Initialize pause
+    context.user_data.setdefault("pause", 500) # Default 500ms
     markup = get_settings_markup(context.user_data)
-    text = "⚙️ **Audio Settings:**\n\n*Pause adds silence between sentences.*"
+    text = "⚙️ **Audio Settings:**\n\n_Note: 'Pause' adds silence after every sentence._"
     if is_new_message: await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
     else: await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
 
@@ -250,16 +259,16 @@ async def collect_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_txt_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await update.message.document.get_file()
     if update.message.document.file_size > 5 * 1024 * 1024:
-        await update.message.reply_text("⚠️ File too large. Max 5MB.")
+        await update.message.reply_text("⚠️ File too large (Max 5MB).")
         return
 
     file_bytes = await file.download_as_bytearray()
     try: text_content = file_bytes.decode('utf-8')
-    except UnicodeDecodeError:
+    except: 
         try: text_content = file_bytes.decode('cp1252')
-        except: await update.message.reply_text("⚠️ Decode error."); return
+        except: await update.message.reply_text("⚠️ Decode failed. Use UTF-8."); return
 
-    if not text_content.strip(): await update.message.reply_text("⚠️ Empty file."); return
+    if not text_content.strip(): return
 
     if "text_buffer" not in context.user_data:
         context.user_data["text_buffer"] = []
@@ -270,7 +279,7 @@ async def handle_txt_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_len = sum(len(t) for t in context.user_data["text_buffer"])
 
     await update.message.reply_text(
-        f"📄 **File Read!** (+{len(text_content)} chars)\n📥 **Total:** {total_len}",
+        f"📄 **File Added.**\n📥 **Total:** {total_len} chars",
         reply_markup=get_control_keyboard(total_len),
         parse_mode=ParseMode.MARKDOWN
     )
@@ -285,15 +294,55 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "clear_buffer":
         context.user_data["text_buffer"] = []
-        await query.edit_message_text("🗑 **Memory Cleared.**")
+        await query.edit_message_text("🗑 **Memory Cleared.** Send new text.")
         return
 
+    # --- SETTINGS LOGIC ---
+    if "rate_" in data or "pitch_" in data:
+        key, val = data.split("_")
+        context.user_data[key] = max(-100, min(100, context.user_data.get(key, 0) + int(val)))
+        await query.edit_message_reply_markup(get_settings_markup(context.user_data))
+        return
+
+    if data == "cycle_pause":
+        # Cycle: 500 -> 1000 -> 0 (Off) -> 100 -> 200 -> 300 -> 400 -> 500
+        current = context.user_data.get("pause", 500)
+        
+        if current == 500: new_pause = 1000
+        elif current == 1000: new_pause = 0
+        elif current == 0: new_pause = 100
+        elif current == 100: new_pause = 200
+        elif current == 200: new_pause = 300
+        elif current == 300: new_pause = 400
+        else: new_pause = 500
+        
+        context.user_data["pause"] = new_pause
+        await query.edit_message_reply_markup(get_settings_markup(context.user_data))
+        return
+
+    if data == "preset_crisp":
+        context.user_data.update({"rate": 10, "pitch": 5, "pause": 500})
+        await query.edit_message_reply_markup(get_settings_markup(context.user_data))
+        return
+
+    if data == "preset_reset":
+        context.user_data.update({"rate": 0, "pitch": 0, "pause": 500})
+        await query.edit_message_reply_markup(get_settings_markup(context.user_data))
+        return
+
+    if data == "close_settings":
+        total = sum(len(t) for t in context.user_data.get("text_buffer", []))
+        if total > 0: await query.edit_message_text(f"📥 **Ready.** (Total: {total} chars)", reply_markup=get_control_keyboard(total), parse_mode=ParseMode.MARKDOWN)
+        else: await query.delete_message(); await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Settings closed.")
+        return
+
+    # --- GENERATE LOGIC ---
     if data == "generate":
         if not context.user_data.get("text_buffer"):
             await query.edit_message_text("⚠️ No text found.")
             return
 
-        await query.edit_message_text("⏳ **Generating...**")
+        await query.edit_message_text("⏳ **Generating...** (Applying SSML Pauses)")
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
 
         try:
@@ -301,28 +350,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             voice = context.user_data.get("voice", DEFAULT_VOICE)
             output_file = f"tts_{query.from_user.id}.mp3"
             
-            # SETTINGS extraction
+            # User Settings
             rate = context.user_data.get("rate", 0)
             pitch = context.user_data.get("pitch", 0)
-            pause = context.user_data.get("pause", 0) # ms
+            pause = context.user_data.get("pause", 500)
             
+            # Format Rate/Pitch for SSML
             rate_str = f"+{rate}%" if rate >= 0 else f"{rate}%"
             pitch_str = f"+{pitch}Hz" if pitch >= 0 else f"{pitch}Hz"
-            
-            # Check for existing SSML
+
+            # Check if user already provided their own SSML
             if raw_text.strip().startswith("<speak>"):
-                # If user manually sent SSML, ignore auto-pause settings
+                # If user manually typed SSML, we just send it as is
                 await edge_tts.Communicate(raw_text, voice).save(output_file)
                 caption = f"🗣 {context.user_data.get('voice_name')}\n(Manual SSML)"
             else:
-                success = await generate_long_audio(raw_text, voice, rate_str, pitch_str, pause, output_file)
-                if not success: raise Exception("Generation failed")
-                caption = f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏸️ {pause}ms"
+                # Use our new SSML generator
+                success = await generate_long_audio_ssml(
+                    raw_text, voice, rate_str, pitch_str, pause, output_file
+                )
+                if not success: raise Exception("SSML Generation failed")
+                
+                pause_lbl = f"{pause}ms" if pause > 0 else "Off"
+                caption = f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏱ {pause_lbl}"
 
             await context.bot.send_audio(
                 chat_id=update.effective_chat.id,
                 audio=open(output_file, "rb"),
-                caption=caption
+                caption=caption,
+                title="TTS Audio"
             )
             os.remove(output_file)
             context.user_data["text_buffer"] = []
@@ -330,10 +386,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             logging.error(f"TTS Error: {e}")
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"⚠️ Error: {str(e)}")
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Error generating audio.")
         return
-
-    # VOICE NAVIGATION
+        
+    # --- VOICE SELECTION ---
     if data.startswith("menu_"):
         region = data.replace("menu_", "")
         keyboard = [[InlineKeyboardButton(n, callback_data=f"set_{c}|{n}")] for n, c in VOICES[region].items()]
@@ -346,10 +402,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["voice"] = code
         context.user_data["voice_name"] = name
         
-        # Play sample
+        await query.edit_message_text(f"⏳ Loading sample for **{name}**...", parse_mode=ParseMode.MARKDOWN)
+        sample_file = f"sample_{query.from_user.id}.mp3"
         try:
-            sample_file = f"sample_{query.from_user.id}.mp3"
-            await edge_tts.Communicate("Hello.", code).save(sample_file)
+            sample_text = "မင်္ဂလာပါ။ Hello."
+            await edge_tts.Communicate(sample_text, code).save(sample_file)
             await context.bot.send_voice(chat_id=update.effective_chat.id, voice=open(sample_file, "rb"))
             os.remove(sample_file)
         except: pass
@@ -357,45 +414,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = sum(len(t) for t in context.user_data.get("text_buffer", []))
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=f"✅ Voice: **{name}**",
+            text=f"✅ Voice set to: **{name}**",
             reply_markup=get_control_keyboard(total)
         )
         return
 
-    # SETTINGS LOGIC
-    if data == "close_settings":
-        total = sum(len(t) for t in context.user_data.get("text_buffer", []))
-        if total > 0: await query.edit_message_text(f"📥 **Ready.**", reply_markup=get_control_keyboard(total))
-        else: await query.delete_message()
-        return
-
-    if "rate_" in data or "pitch_" in data or "pause_" in data:
-        key, val = data.split("_")
-        current_val = context.user_data.get(key, 0)
-        
-        if key == "pause":
-            # Pause limit: 0ms to 5000ms (5 seconds)
-            new_val = max(0, min(5000, current_val + int(val)))
-        else:
-            # Rate/Pitch limit: -100 to 100
-            new_val = max(-100, min(100, current_val + int(val)))
-            
-        context.user_data[key] = new_val
-        await query.edit_message_reply_markup(get_settings_markup(context.user_data))
-        return
-
-    if data == "preset_crisp":
-        context.user_data.update({"rate": 10, "pitch": 5, "pause": 0})
-        await query.edit_message_reply_markup(get_settings_markup(context.user_data))
-        return
-
-    if data == "preset_reset":
-        context.user_data.update({"rate": 0, "pitch": 0, "pause": 0})
-        await query.edit_message_reply_markup(get_settings_markup(context.user_data))
-        return
-
 async def post_init(application: Application):
-    await application.bot.set_my_commands([("start", "Restart"), ("voice", "Voice"), ("settings", "Settings")])
+    await application.bot.set_my_commands([("start", "Restart"), ("voice", "Change Speaker"), ("settings", "Settings")])
 
 def main():
     if not TOKEN: print("❌ TELEGRAM_TOKEN missing"); return
