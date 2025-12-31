@@ -80,31 +80,36 @@ def run_web_server():
     server.serve_forever()
 
 # --- HELPER FUNCTIONS ---
-def preprocess_text_for_pauses(text):
+
+def preprocess_text_with_markers(text):
+    """
+    1. Replaces 'Real' Sentence Ends with ###STOP###
+    2. Replaces 'Real' Paragraphs with ###PARA###
+    This protects them so we can split correctly later.
+    """
     if not text: return ""
     
-    # 1. Hide Newlines (Paragraphs) temporarily so they don't get turned into commas
-    text = text.replace("\n", "###NEWLINE###")
+    # Normalize newlines
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
     
-    # 2. Convert Standard Stops to Commas (~200ms)
-    text = text.replace("။", ", ") 
-    text = text.replace("。", ", ") 
-    text = text.replace(".", ", ") 
-    text = text.replace("!", ", ")
-    text = text.replace("?", ", ")
+    # 1. Mark Paragraphs (Enter key)
+    text = text.replace("\n", "###PARA###")
     
-    # 3. Restore Newlines as Periods (~500ms)
-    text = text.replace("###NEWLINE###", ". ")
-    
-    # 4. Clean up (Remove weird combos like ", ." or double commas)
-    text = text.replace(", .", ".") 
-    text = text.replace(".,", ".")
-    text = text.replace(", ,", ",")
+    # 2. Mark Sentence Ends (Stops)
+    # We use a special tag so we don't confuse them with mid-sentence commas
+    text = text.replace("။", "###STOP###") 
+    text = text.replace("。", "###STOP###") 
+    text = text.replace(".", "###STOP###") 
+    text = text.replace("!", "###STOP###")
+    text = text.replace("?", "###STOP###")
     
     return text
 
-def split_text_smart(text, chunk_size):
-    """Splits text into chunks, prioritizing our new 'Period' paragraph markers."""
+def split_text_strictly(text, chunk_size):
+    """
+    Splits text ONLY at ###STOP### or ###PARA### markers.
+    Does NOT split at normal commas.
+    """
     if len(text) <= chunk_size:
         return [text]
     
@@ -116,22 +121,20 @@ def split_text_smart(text, chunk_size):
         
         split_at = -1
         
-        # 1. Try to split at our new Paragraph markers (Periods)
-        period_pos = text.rfind('. ', 0, chunk_size)
-        if period_pos != -1:
-            split_at = period_pos + 1
+        # Priority 1: Split at Paragraph Marker
+        para_pos = text.rfind('###PARA###', 0, chunk_size)
+        if para_pos != -1:
+            split_at = para_pos + len("###PARA###")
         else:
-            # 2. Fallback to Sentence markers (Commas)
-            comma_pos = text.rfind(', ', 0, chunk_size)
-            if comma_pos != -1:
-                split_at = comma_pos + 1
+            # Priority 2: Split at Sentence Stop Marker
+            stop_pos = text.rfind('###STOP###', 0, chunk_size)
+            if stop_pos != -1:
+                split_at = stop_pos + len("###STOP###")
             else:
-                # 3. Last resort: split at space
+                # Emergency Fallback: If a single sentence is > 2500 chars (unlikely)
+                # We split at a space to prevent crashing
                 space_pos = text.rfind(' ', 0, chunk_size)
-                if space_pos != -1:
-                    split_at = space_pos + 1
-                else:
-                    split_at = chunk_size
+                split_at = space_pos + 1 if space_pos != -1 else chunk_size
         
         chunks.append(text[:split_at])
         text = text[split_at:]
@@ -139,16 +142,30 @@ def split_text_smart(text, chunk_size):
     return chunks
 
 async def generate_long_audio(text, voice, rate_str, pitch_str, final_filename):
-    """Generates audio in chunks."""
-    chunks = split_text_smart(text, CHUNK_SIZE)
+    """Generates audio by processing chunks and converting markers to pauses."""
+    
+    # 1. Tag the text
+    tagged_text = preprocess_text_with_markers(text)
+    
+    # 2. Split strictly by tags
+    chunks = split_text_strictly(tagged_text, CHUNK_SIZE)
+    
     merged_audio = b""
     
     for i, chunk in enumerate(chunks):
         if not chunk.strip(): continue
         
+        # 3. CONVERT MARKERS TO PAUSES (Just before generating)
+        # ###STOP### -> ", " (200ms pause)
+        # ###PARA### -> ". " (500ms pause)
+        final_chunk = chunk.replace("###STOP###", ", ").replace("###PARA###", ". ")
+        
+        # Clean up double punctuation just in case
+        final_chunk = final_chunk.replace(", .", ".").replace(".,", ".")
+        
         temp_file = f"temp_chunk_{i}_{final_filename}"
         try:
-            communicate = edge_tts.Communicate(chunk, voice, rate=rate_str, pitch=pitch_str)
+            communicate = edge_tts.Communicate(final_chunk, voice, rate=rate_str, pitch=pitch_str)
             await communicate.save(temp_file)
             
             with open(temp_file, "rb") as f:
@@ -282,7 +299,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ No text found.")
             return
 
-        await query.edit_message_text("⏳ **Generating...** (Splitting large text)")
+        await query.edit_message_text("⏳ **Generating...** (Splitting strictly by sentence)")
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
 
         try:
@@ -290,17 +307,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             voice = context.user_data.get("voice", DEFAULT_VOICE)
             output_file = f"tts_{query.from_user.id}.mp3"
             
-            # --- METHOD 1 APPLIED (Optimized) ---
-            final_text = preprocess_text_for_pauses(raw_text)
-            
             rate, pitch = context.user_data.get("rate", 0), context.user_data.get("pitch", 0)
             rate_str = f"+{rate}%" if rate >= 0 else f"{rate}%"
             pitch_str = f"+{pitch}Hz" if pitch >= 0 else f"{pitch}Hz"
             
-            success = await generate_long_audio(final_text, voice, rate_str, pitch_str, output_file)
+            # Use the new Robust Generation
+            success = await generate_long_audio(raw_text, voice, rate_str, pitch_str, output_file)
             if not success: raise Exception("Chunk generation failed")
             
-            caption = f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏩ Fast Mode"
+            caption = f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏩ Smart Flow"
 
             await context.bot.send_audio(
                 chat_id=update.effective_chat.id,
