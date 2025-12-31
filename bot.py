@@ -131,8 +131,7 @@ def split_text_strictly(text, chunk_size):
             if stop_pos != -1:
                 split_at = stop_pos + len("###STOP###")
             else:
-                # Emergency Fallback: If a single sentence is > 2500 chars (unlikely)
-                # We split at a space to prevent crashing
+                # Emergency Fallback
                 space_pos = text.rfind(' ', 0, chunk_size)
                 split_at = space_pos + 1 if space_pos != -1 else chunk_size
         
@@ -155,13 +154,13 @@ async def generate_long_audio(text, voice, rate_str, pitch_str, final_filename):
     for i, chunk in enumerate(chunks):
         if not chunk.strip(): continue
         
-        # 3. CONVERT MARKERS TO PAUSES (Just before generating)
-        # ###STOP### -> ", " (200ms pause)
-        # ###PARA### -> ". " (500ms pause)
-        final_chunk = chunk.replace("###STOP###", ", ").replace("###PARA###", ". ")
+        # 3. CONVERT MARKERS TO PAUSES
+        # Here is the change: Both STOP and PARA become ", " (Comma)
+        # This results in a fast 200ms pause for EVERYTHING.
+        final_chunk = chunk.replace("###STOP###", ", ").replace("###PARA###", ", ")
         
-        # Clean up double punctuation just in case
-        final_chunk = final_chunk.replace(", .", ".").replace(".,", ".")
+        # Clean up double punctuation
+        final_chunk = final_chunk.replace(", ,", ",")
         
         temp_file = f"temp_chunk_{i}_{final_filename}"
         try:
@@ -311,11 +310,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rate_str = f"+{rate}%" if rate >= 0 else f"{rate}%"
             pitch_str = f"+{pitch}Hz" if pitch >= 0 else f"{pitch}Hz"
             
-            # Use the new Robust Generation
             success = await generate_long_audio(raw_text, voice, rate_str, pitch_str, output_file)
             if not success: raise Exception("Chunk generation failed")
             
-            caption = f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏩ Smart Flow"
+            caption = f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏩ Fast 200ms Flow"
 
             await context.bot.send_audio(
                 chat_id=update.effective_chat.id,
