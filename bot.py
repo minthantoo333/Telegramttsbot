@@ -18,7 +18,7 @@ from telegram.ext import (
 # --- CONFIGURATION ---
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DEFAULT_VOICE = "my-MM-ThihaNeural"
-CHUNK_SIZE = 2500  # Split text every 2500 chars to prevent crashes
+CHUNK_SIZE = 2500  # Split text every 2500 chars
 
 # --- FULL VOICE DATABASE ---
 VOICES = {
@@ -82,24 +82,16 @@ def run_web_server():
 # --- HELPER FUNCTIONS ---
 def preprocess_text_for_pauses(text):
     if not text: return ""
-    
-    # --- METHOD 1: THE COMMA TRICK ---
-    # We replace "Heavy" punctuation (periods/stops) with "Light" punctuation (commas).
-    # This forces the AI to take a short breath (~200ms) instead of a full stop (~500ms+).
-    # We add a newline (\n) after the comma to ensure the text splitter still finds safe places to cut.
-    
-    text = text.replace("။", ", \n") 
-    text = text.replace("。", ", \n") 
-    text = text.replace(".", ", \n") 
-    text = text.replace("!", ", \n")
-    text = text.replace("?", ", \n")
-    
-    # Remove accidental double commas
-    text = text.replace(", ,", ",")
+    # Inject 200ms break + newline (newline helps the splitter find a safe cut point)
+    text = text.replace("။", "။<break time='200ms'/>\n") 
+    text = text.replace("、", "、<break time='200ms'/> ") 
+    text = text.replace(".", ".<break time='200ms'/>\n") 
+    text = text.replace("?", "?<break time='200ms'/>\n")
+    text = text.replace("!", "!<break time='200ms'/>\n")
     return text
 
 def split_text_smart(text, chunk_size):
-    """Splits text into chunks, trying to break at newlines."""
+    """Splits text into chunks, trying to break at newlines/periods."""
     if len(text) <= chunk_size:
         return [text]
     
@@ -110,17 +102,16 @@ def split_text_smart(text, chunk_size):
             break
         
         split_at = -1
-        # Check last newline (our preprocess function adds these)
+        # Check last newline (our preprocess function adds these after breaks)
         newline_pos = text.rfind('\n', 0, chunk_size)
         if newline_pos != -1:
             split_at = newline_pos + 1
         else:
-            # Check last comma if no newline found
-            comma_pos = text.rfind(',', 0, chunk_size)
-            if comma_pos != -1:
-                split_at = comma_pos + 1
+            # Check last period
+            period_pos = text.rfind('.', 0, chunk_size)
+            if period_pos != -1:
+                split_at = period_pos + 1
             else:
-                # Force split if no safe place found
                 split_at = chunk_size
         
         chunks.append(text[:split_at])
@@ -129,7 +120,7 @@ def split_text_smart(text, chunk_size):
     return chunks
 
 async def generate_long_audio(text, voice, rate_str, pitch_str, final_filename):
-    """Generates audio in chunks and merges them (Standard Method)."""
+    """Generates audio in chunks using SSML wrapper for correct pauses."""
     chunks = split_text_smart(text, CHUNK_SIZE)
     merged_audio = b""
     
@@ -138,11 +129,19 @@ async def generate_long_audio(text, voice, rate_str, pitch_str, final_filename):
         
         temp_file = f"temp_chunk_{i}_{final_filename}"
         try:
-            # Standard generation - NO SSML required
-            communicate = edge_tts.Communicate(chunk, voice, rate=rate_str, pitch=pitch_str)
+            # Wrap in SSML to enforce pause time and speed/pitch
+            ssml_text = (
+                f"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>"
+                f"<prosody rate='{rate_str}' pitch='{pitch_str}'>"
+                f"{chunk}"
+                f"</prosody>"
+                f"</speak>"
+            )
+
+            # NOTE: We pass rate/pitch inside SSML, so we don't pass them as args here
+            communicate = edge_tts.Communicate(ssml_text, voice)
             await communicate.save(temp_file)
             
-            # Read binary and append
             with open(temp_file, "rb") as f:
                 merged_audio += f.read()
             
@@ -152,7 +151,6 @@ async def generate_long_audio(text, voice, rate_str, pitch_str, final_filename):
             if os.path.exists(temp_file): os.remove(temp_file)
             return False
 
-    # Save merged file
     with open(final_filename, "wb") as f:
         f.write(merged_audio)
     return True
@@ -283,18 +281,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             voice = context.user_data.get("voice", DEFAULT_VOICE)
             output_file = f"tts_{query.from_user.id}.mp3"
             
-            # --- METHOD 1 APPLIED ---
-            final_text = preprocess_text_for_pauses(raw_text)
-            
-            rate, pitch = context.user_data.get("rate", 0), context.user_data.get("pitch", 0)
-            rate_str = f"+{rate}%" if rate >= 0 else f"{rate}%"
-            pitch_str = f"+{pitch}Hz" if pitch >= 0 else f"{pitch}Hz"
-            
-            # Standard Generation
-            success = await generate_long_audio(final_text, voice, rate_str, pitch_str, output_file)
-            if not success: raise Exception("Chunk generation failed")
-            
-            caption = f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏩ Fast Pauses"
+            # SSML Check: If user manually sent SSML, we respect it.
+            # If plain text, we auto-convert with 200ms pauses.
+            if raw_text.strip().startswith("<speak>"):
+                await edge_tts.Communicate(raw_text, voice).save(output_file)
+                caption = f"🗣 {context.user_data.get('voice_name')}\n(Manual SSML)"
+            else:
+                # 1. Inject 200ms pauses
+                final_text = preprocess_text_for_pauses(raw_text)
+                
+                # 2. Get Settings
+                rate, pitch = context.user_data.get("rate", 0), context.user_data.get("pitch", 0)
+                rate_str = f"+{rate}%" if rate >= 0 else f"{rate}%"
+                pitch_str = f"+{pitch}Hz" if pitch >= 0 else f"{pitch}Hz"
+                
+                # 3. Generate using Smart SSML Wrapper
+                success = await generate_long_audio(final_text, voice, rate_str, pitch_str, output_file)
+                if not success: raise Exception("Chunk generation failed")
+                caption = f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏸️ 200ms"
 
             await context.bot.send_audio(
                 chat_id=update.effective_chat.id,
