@@ -90,13 +90,24 @@ def run_web_server():
 
 def preprocess_text_for_pauses(text):
     """
-    Replaces punctuation with SPACES instead of NEWLINES.
-    Effect: Reduces pause from ~800ms (Paragraph break) to ~100-200ms (Sentence break).
+    TUNED FOR 200-300ms PAUSE (Narrator Style)
+    1. Removes all newlines (\n) -> Prevents the long 800ms pause.
+    2. Uses "။ " -> Triggers the natural sentence break (approx 300ms).
     """
     if not text: return ""
+    
+    # 1. Remove Newlines (The "Long Pause" killer)
+    text = text.replace("\n", " ")
+    
+    # 2. Normalize Punctuation (The "Medium Pause" creator)
+    # Adding a space after '။' ensures the engine sees it as a sentence end.
     text = text.replace("။", "။ ") 
     text = text.replace("、", "、 ") 
     text = text.replace(".", ". ") 
+    
+    # 3. Clean up accidental double spaces
+    text = " ".join(text.split())
+    
     return text
 
 def split_text_smart(text, chunk_size):
@@ -307,7 +318,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             # JOIN BUFFER
-            raw_text = "".join(context.user_data["text_buffer"]) # No \n join to avoid extra pauses
+            raw_text = "".join(context.user_data["text_buffer"]) 
             voice = context.user_data.get("voice", DEFAULT_VOICE)
             output_file = f"tts_{query.from_user.id}.mp3"
             
@@ -316,7 +327,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await edge_tts.Communicate(raw_text, voice).save(output_file)
                 caption = f"🗣 {context.user_data.get('voice_name')}\n(SSML)"
             else:
-                # 1. CLEAN PAUSES (Replace punct with space)
+                # 1. CLEAN PAUSES (200-300ms logic applied here)
                 final_text = preprocess_text_for_pauses(raw_text)
                 
                 rate, pitch = context.user_data.get("rate", 0), context.user_data.get("pitch", 0)
