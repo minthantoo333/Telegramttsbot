@@ -1,5 +1,6 @@
 import os
 import logging
+import re  # Required for the "Burmese Glue" fix
 import threading
 import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -79,37 +80,59 @@ def run_web_server():
     print(f"🌍 Web server listening on port {port}")
     server.serve_forever()
 
-# --- HELPER FUNCTIONS ---
+# --- HELPER FUNCTIONS (FIXED FOR BURMESE FLOW) ---
 
 def preprocess_text_with_markers(text):
     """
-    1. Replaces 'Real' Sentence Ends with ###STOP###
-    2. Replaces 'Real' Paragraphs with ###PARA###
-    This protects them so we can split correctly later.
+    Intelligent Pre-processing:
+    1. Glues broken Burmese syllables together (Fixes 'လှမ်း... ခေါ်' pause).
+    2. Protects Abbreviations & Decimals.
+    3. Marks ONLY real sentences as ###STOP###.
     """
     if not text: return ""
     
-    # Normalize newlines
+    # 1. Normalize Newlines
     text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+    # --- 🔴 THE FIX FOR BURMESE PAUSES ---
+    # This Regex finds: (MyanmarChar) + SPACE + (MyanmarChar)
+    # And replaces it with: (MyanmarChar)(MyanmarChar)
+    # It removes spaces/invisible characters between Burmese words to force smooth reading.
+    text = re.sub(r'([\u1000-\u109f])\s+([\u1000-\u109f])', r'\1\2', text)
+    # -------------------------------------
     
-    # 1. Mark Paragraphs (Enter key)
-    text = text.replace("\n", "###PARA###")
+    # 2. Protection List (Don't pause here)
+    protected = {
+        "Dr.": "Dr_DOT", "Mr.": "Mr_DOT", "Mrs.": "Mrs_DOT", "Ms.": "Ms_DOT",
+        "No.": "No_DOT", "St.": "St_DOT", "vs.": "vs_DOT", "etc.": "etc_DOT"
+    }
+    for k, v in protected.items():
+        text = text.replace(k, v)
+        text = text.replace(k.lower(), v)
     
-    # 2. Mark Sentence Ends (Stops)
-    # We use a special tag so we don't confuse them with mid-sentence commas
-    text = text.replace("။", "###STOP###") 
-    text = text.replace("。", "###STOP###") 
-    text = text.replace(".", "###STOP###") 
-    text = text.replace("!", "###STOP###")
-    text = text.replace("?", "###STOP###")
+    # 3. Mark Paragraphs
+    text = text.replace("\n", " ###PARA### ")
+
+    # 4. Mark Myanmar Punctuation (Always Stops)
+    text = text.replace("။", " ###STOP### ")
+    text = text.replace("。", " ###STOP### ")
     
+    # 5. Mark English Punctuation
+    text = text.replace("!", " ###STOP### ")
+    text = text.replace("?", " ###STOP### ")
+    
+    # 6. Smart Period Replacement (Ignore 3.5, V2.0)
+    text = re.sub(r'(?<!\d)\.(?!\d)', ' ###STOP### ', text)
+    
+    # 7. Restore Protected Words
+    for k, v in protected.items():
+        original_word = k 
+        text = text.replace(v, original_word)
+
     return text
 
 def split_text_strictly(text, chunk_size):
-    """
-    Splits text ONLY at ###STOP### or ###PARA### markers.
-    Does NOT split at normal commas.
-    """
+    """Splits text ONLY at markers."""
     if len(text) <= chunk_size:
         return [text]
     
@@ -120,13 +143,12 @@ def split_text_strictly(text, chunk_size):
             break
         
         split_at = -1
-        
-        # Priority 1: Split at Paragraph Marker
+        # Priority 1: Paragraph
         para_pos = text.rfind('###PARA###', 0, chunk_size)
         if para_pos != -1:
             split_at = para_pos + len("###PARA###")
         else:
-            # Priority 2: Split at Sentence Stop Marker
+            # Priority 2: Sentence Stop
             stop_pos = text.rfind('###STOP###', 0, chunk_size)
             if stop_pos != -1:
                 split_at = stop_pos + len("###STOP###")
@@ -141,35 +163,26 @@ def split_text_strictly(text, chunk_size):
     return chunks
 
 async def generate_long_audio(text, voice, rate_str, pitch_str, final_filename):
-    """Generates audio by processing chunks and converting markers to pauses."""
-    
-    # 1. Tag the text
+    """Generates audio with corrected flow."""
     tagged_text = preprocess_text_with_markers(text)
-    
-    # 2. Split strictly by tags
     chunks = split_text_strictly(tagged_text, CHUNK_SIZE)
-    
     merged_audio = b""
     
     for i, chunk in enumerate(chunks):
         if not chunk.strip(): continue
         
-        # 3. CONVERT MARKERS TO PAUSES
-        # Here is the change: Both STOP and PARA become ", " (Comma)
-        # This results in a fast 200ms pause for EVERYTHING.
+        # Both STOP and PARA become ", " (Comma) -> 200ms pause
         final_chunk = chunk.replace("###STOP###", ", ").replace("###PARA###", ", ")
         
-        # Clean up double punctuation
+        # Double check no "Dr, " issues remain
         final_chunk = final_chunk.replace(", ,", ",")
         
         temp_file = f"temp_chunk_{i}_{final_filename}"
         try:
             communicate = edge_tts.Communicate(final_chunk, voice, rate=rate_str, pitch=pitch_str)
             await communicate.save(temp_file)
-            
             with open(temp_file, "rb") as f:
                 merged_audio += f.read()
-            
             os.remove(temp_file)
         except Exception as e:
             logging.error(f"Chunk error: {e}")
@@ -180,7 +193,7 @@ async def generate_long_audio(text, voice, rate_str, pitch_str, final_filename):
         f.write(merged_audio)
     return True
 
-# --- KEYBOARDS ---
+# --- KEYBOARDS & MENUS ---
 def get_control_keyboard(total_chars):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"✅ Generate Audio ({total_chars} chars)", callback_data="generate")],
@@ -202,7 +215,6 @@ def get_settings_markup(data):
         [InlineKeyboardButton("✅ Close Settings", callback_data="close_settings")]
     ])
 
-# --- MENUS ---
 async def show_voice_menu(update, context, is_new_message=False):
     keyboard = [[InlineKeyboardButton(r, callback_data=f"menu_{r}")] for r in VOICES.keys()]
     keyboard.append([InlineKeyboardButton("❌ Close", callback_data="close_settings")])
@@ -223,8 +235,8 @@ async def show_settings_menu(update, context, is_new_message=False):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data["text_buffer"] = []
-    context.user_data["voice"] = DEFAULT_VOICE
-    context.user_data["voice_name"] = "Burmese (Thiha)"
+    context.user_data.setdefault("voice", DEFAULT_VOICE)
+    context.user_data.setdefault("voice_name", "Burmese (Thiha)")
     await update.message.reply_text("👋 **Bot Restarted!**\n\nSend me text or a .txt file to begin.", parse_mode=ParseMode.MARKDOWN)
 
 async def command_voice(update, context): await show_voice_menu(update, context, True)
@@ -240,45 +252,25 @@ async def collect_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["text_buffer"].append(text)
     total_len = sum(len(t) for t in context.user_data["text_buffer"])
     
-    await update.message.reply_text(
-        f"📥 **Saved.** (Total: {total_len} chars)",
-        reply_markup=get_control_keyboard(total_len),
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await update.message.reply_text(f"📥 **Saved.** (Total: {total_len} chars)", reply_markup=get_control_keyboard(total_len), parse_mode=ParseMode.MARKDOWN)
 
 async def handle_txt_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await update.message.document.get_file()
     if update.message.document.file_size > 5 * 1024 * 1024:
-        await update.message.reply_text("⚠️ File too large. Please send files smaller than 5MB.")
+        await update.message.reply_text("⚠️ File too large.")
         return
-
     file_bytes = await file.download_as_bytearray()
-    try:
-        text_content = file_bytes.decode('utf-8')
-    except UnicodeDecodeError:
-        try:
-            text_content = file_bytes.decode('cp1252')
-        except:
-            await update.message.reply_text("⚠️ Could not decode file. Please ensure it is UTF-8 encoded text.")
-            return
+    try: text_content = file_bytes.decode('utf-8')
+    except: text_content = file_bytes.decode('cp1252', errors='ignore')
 
-    if not text_content.strip():
-        await update.message.reply_text("⚠️ File appears to be empty.")
-        return
-
+    if not text_content.strip(): return
     if "text_buffer" not in context.user_data:
         context.user_data["text_buffer"] = []
         context.user_data.setdefault("voice", DEFAULT_VOICE)
         context.user_data.setdefault("voice_name", "Burmese (Thiha)")
 
     context.user_data["text_buffer"].append(text_content)
-    total_len = sum(len(t) for t in context.user_data["text_buffer"])
-
-    await update.message.reply_text(
-        f"📄 **File Read Successfully!**\nAdded {len(text_content)} chars.\n\n📥 **Total Buffer:** {total_len} chars",
-        reply_markup=get_control_keyboard(total_len),
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await update.message.reply_text(f"📄 **File Read.**\nTotal: {sum(len(t) for t in context.user_data['text_buffer'])} chars", reply_markup=get_control_keyboard(len(text_content)), parse_mode=ParseMode.MARKDOWN)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -287,18 +279,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "open_voice_menu": await show_voice_menu(update, context, False); return
     if data == "open_settings": await show_settings_menu(update, context, False); return
-
     if data == "clear_buffer":
         context.user_data["text_buffer"] = []
-        await query.edit_message_text("🗑 **Memory Cleared.** Send new text.")
+        await query.edit_message_text("🗑 **Memory Cleared.**")
         return
 
     if data == "generate":
-        if not context.user_data.get("text_buffer"):
-            await query.edit_message_text("⚠️ No text found.")
-            return
-
-        await query.edit_message_text("⏳ **Generating...** (Splitting strictly by sentence)")
+        if not context.user_data.get("text_buffer"): await query.edit_message_text("⚠️ No text."); return
+        await query.edit_message_text("⏳ **Generating...**")
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
 
         try:
@@ -307,30 +295,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             output_file = f"tts_{query.from_user.id}.mp3"
             
             rate, pitch = context.user_data.get("rate", 0), context.user_data.get("pitch", 0)
-            rate_str = f"+{rate}%" if rate >= 0 else f"{rate}%"
-            pitch_str = f"+{pitch}Hz" if pitch >= 0 else f"{pitch}Hz"
-            
-            success = await generate_long_audio(raw_text, voice, rate_str, pitch_str, output_file)
-            if not success: raise Exception("Chunk generation failed")
-            
-            caption = f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏩ Fast 200ms Flow"
+            rate_str, pitch_str = f"+{rate}%" if rate >=0 else f"{rate}%", f"+{pitch}Hz" if pitch >=0 else f"{pitch}Hz"
 
+            success = await generate_long_audio(raw_text, voice, rate_str, pitch_str, output_file)
+            if not success: raise Exception("Gen failed")
+            
             await context.bot.send_audio(
                 chat_id=update.effective_chat.id,
                 audio=open(output_file, "rb"),
-                caption=caption,
+                caption=f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏩ Smooth Burmese Flow",
                 title="TTS Audio"
             )
             os.remove(output_file)
             context.user_data["text_buffer"] = []
             await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Done!")
-
         except Exception as e:
             logging.error(f"TTS Error: {e}")
-            await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Error generating audio.")
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Error.")
         return
 
-    # VOICE NAVIGATION
     if data.startswith("menu_"):
         region = data.replace("menu_", "")
         keyboard = [[InlineKeyboardButton(n, callback_data=f"set_{c}|{n}")] for n, c in VOICES[region].items()]
@@ -338,34 +321,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"📂 **{region}**", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # VOICE SELECTION
     if data.startswith("set_"):
         code, name = data.replace("set_", "").split("|")
-        context.user_data["voice"] = code
-        context.user_data["voice_name"] = name
-        
-        await query.edit_message_text(f"⏳ Loading sample for **{name}**...", parse_mode=ParseMode.MARKDOWN)
-        sample_file = f"sample_{query.from_user.id}.mp3"
-        try:
-            sample_text = "Hello."
-            await edge_tts.Communicate(sample_text, code).save(sample_file)
-            await context.bot.send_voice(chat_id=update.effective_chat.id, voice=open(sample_file, "rb"))
-            os.remove(sample_file)
-        except: pass
-
-        total = sum(len(t) for t in context.user_data.get("text_buffer", []))
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"✅ Voice set to: **{name}**",
-            reply_markup=get_control_keyboard(total)
-        )
-        return
-
-    # SETTINGS
-    if data == "close_settings":
-        total = sum(len(t) for t in context.user_data.get("text_buffer", []))
-        if total > 0: await query.edit_message_text(f"📥 **Ready.** (Total: {total} chars)", reply_markup=get_control_keyboard(total), parse_mode=ParseMode.MARKDOWN)
-        else: await query.delete_message(); await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Settings closed.")
+        context.user_data["voice"], context.user_data["voice_name"] = code, name
+        await query.edit_message_text(f"✅ Set to: **{name}**", reply_markup=get_control_keyboard(sum(len(t) for t in context.user_data.get("text_buffer", []))), parse_mode=ParseMode.MARKDOWN)
         return
 
     if "rate_" in data or "pitch_" in data:
@@ -378,26 +337,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.update({"rate": 10, "pitch": 5})
         await query.edit_message_reply_markup(get_settings_markup(context.user_data))
         return
-
     if data == "preset_reset":
         context.user_data.update({"rate": 0, "pitch": 0})
         await query.edit_message_reply_markup(get_settings_markup(context.user_data))
         return
+    if data == "close_settings":
+        await query.delete_message()
+        return
 
 async def post_init(application: Application):
-    await application.bot.set_my_commands([("start", "Restart"), ("voice", "Change Speaker"), ("settings", "Settings")])
+    await application.bot.set_my_commands([("start", "Reset"), ("voice", "Voices"), ("settings", "Settings")])
 
 def main():
     if not TOKEN: print("❌ TELEGRAM_TOKEN missing"); return
     application = Application.builder().token(TOKEN).post_init(post_init).build()
-    
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("voice", command_voice))
     application.add_handler(CommandHandler("settings", command_settings))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_text))
     application.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_txt_file))
     application.add_handler(CallbackQueryHandler(button_handler))
-    
     print("🤖 Bot is starting...")
     application.run_polling()
 
