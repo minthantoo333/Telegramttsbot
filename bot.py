@@ -83,22 +83,28 @@ def run_web_server():
 def preprocess_text_for_pauses(text):
     if not text: return ""
     
-    # 🔴 FIX IS HERE:
-    # We replaced "။" with ", " (Comma + Space).
-    # We REMOVED the "\n" (newline) because newlines cause long pauses.
+    # 1. Hide Newlines (Paragraphs) temporarily so they don't get turned into commas
+    text = text.replace("\n", "###NEWLINE###")
     
+    # 2. Convert Standard Stops to Commas (~200ms)
     text = text.replace("။", ", ") 
     text = text.replace("。", ", ") 
     text = text.replace(".", ", ") 
     text = text.replace("!", ", ")
     text = text.replace("?", ", ")
     
-    # Clean up any accidental double punctuation
+    # 3. Restore Newlines as Periods (~500ms)
+    text = text.replace("###NEWLINE###", ". ")
+    
+    # 4. Clean up (Remove weird combos like ", ." or double commas)
+    text = text.replace(", .", ".") 
+    text = text.replace(".,", ".")
     text = text.replace(", ,", ",")
+    
     return text
 
 def split_text_smart(text, chunk_size):
-    """Splits text into chunks at safest nearby punctuation."""
+    """Splits text into chunks, prioritizing our new 'Period' paragraph markers."""
     if len(text) <= chunk_size:
         return [text]
     
@@ -108,21 +114,24 @@ def split_text_smart(text, chunk_size):
             chunks.append(text)
             break
         
-        # 🔴 UPDATED SPLITTER:
-        # Since we removed newlines, we must now look for ", " to split safely.
         split_at = -1
         
-        comma_pos = text.rfind(', ', 0, chunk_size)
-        if comma_pos != -1:
-            split_at = comma_pos + 1
+        # 1. Try to split at our new Paragraph markers (Periods)
+        period_pos = text.rfind('. ', 0, chunk_size)
+        if period_pos != -1:
+            split_at = period_pos + 1
         else:
-            # Fallback: look for space
-            space_pos = text.rfind(' ', 0, chunk_size)
-            if space_pos != -1:
-                split_at = space_pos + 1
+            # 2. Fallback to Sentence markers (Commas)
+            comma_pos = text.rfind(', ', 0, chunk_size)
+            if comma_pos != -1:
+                split_at = comma_pos + 1
             else:
-                # Force split if absolutely no breaks
-                split_at = chunk_size
+                # 3. Last resort: split at space
+                space_pos = text.rfind(' ', 0, chunk_size)
+                if space_pos != -1:
+                    split_at = space_pos + 1
+                else:
+                    split_at = chunk_size
         
         chunks.append(text[:split_at])
         text = text[split_at:]
@@ -281,7 +290,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             voice = context.user_data.get("voice", DEFAULT_VOICE)
             output_file = f"tts_{query.from_user.id}.mp3"
             
-            # --- METHOD 1 APPLIED ---
+            # --- METHOD 1 APPLIED (Optimized) ---
             final_text = preprocess_text_for_pauses(raw_text)
             
             rate, pitch = context.user_data.get("rate", 0), context.user_data.get("pitch", 0)
@@ -291,7 +300,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success = await generate_long_audio(final_text, voice, rate_str, pitch_str, output_file)
             if not success: raise Exception("Chunk generation failed")
             
-            caption = f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏩ Fast Pauses"
+            caption = f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏩ Fast Mode"
 
             await context.bot.send_audio(
                 chat_id=update.effective_chat.id,
