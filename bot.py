@@ -1,6 +1,6 @@
 import os
 import logging
-import re  # Required for the "Burmese Glue" fix
+import re
 import threading
 import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -19,7 +19,6 @@ from telegram.ext import (
 # --- CONFIGURATION ---
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DEFAULT_VOICE = "my-MM-ThihaNeural"
-CHUNK_SIZE = 2500
 
 # --- FULL VOICE DATABASE ---
 VOICES = {
@@ -80,28 +79,19 @@ def run_web_server():
     print(f"🌍 Web server listening on port {port}")
     server.serve_forever()
 
-# --- HELPER FUNCTIONS (FIXED FOR BURMESE FLOW) ---
+# --- HELPER FUNCTIONS ---
 
-def preprocess_text_with_markers(text):
+def preprocess_text_smart(text):
     """
-    Intelligent Pre-processing:
-    1. Glues broken Burmese syllables together (Fixes 'လှမ်း... ခေါ်' pause).
-    2. Protects Abbreviations & Decimals.
-    3. Marks ONLY real sentences as ###STOP###.
+    1. Protects Abbreviations (Dr., No.) & Decimals (3.5).
+    2. Converts Real Sentences & Paragraphs to commas for fast flow.
     """
     if not text: return ""
     
     # 1. Normalize Newlines
     text = text.replace('\r\n', '\n').replace('\r', '\n')
-
-    # --- 🔴 THE FIX FOR BURMESE PAUSES ---
-    # This Regex finds: (MyanmarChar) + SPACE + (MyanmarChar)
-    # And replaces it with: (MyanmarChar)(MyanmarChar)
-    # It removes spaces/invisible characters between Burmese words to force smooth reading.
-    text = re.sub(r'([\u1000-\u109f])\s+([\u1000-\u109f])', r'\1\2', text)
-    # -------------------------------------
     
-    # 2. Protection List (Don't pause here)
+    # 2. Protect Abbreviations & Decimals
     protected = {
         "Dr.": "Dr_DOT", "Mr.": "Mr_DOT", "Mrs.": "Mrs_DOT", "Ms.": "Ms_DOT",
         "No.": "No_DOT", "St.": "St_DOT", "vs.": "vs_DOT", "etc.": "etc_DOT"
@@ -109,89 +99,47 @@ def preprocess_text_with_markers(text):
     for k, v in protected.items():
         text = text.replace(k, v)
         text = text.replace(k.lower(), v)
-    
-    # 3. Mark Paragraphs
-    text = text.replace("\n", " ###PARA### ")
 
-    # 4. Mark Myanmar Punctuation (Always Stops)
-    text = text.replace("။", " ###STOP### ")
-    text = text.replace("。", " ###STOP### ")
+    # 3. Mark Paragraphs (Enter key) -> Convert directly to comma
+    text = text.replace("\n", ", ")
+
+    # 4. Mark Myanmar Punctuation -> Convert directly to comma
+    text = text.replace("။", ", ")
+    text = text.replace("。", ", ")
     
-    # 5. Mark English Punctuation
-    text = text.replace("!", " ###STOP### ")
-    text = text.replace("?", " ###STOP### ")
+    # 5. Mark English Punctuation -> Convert directly to comma
+    text = text.replace("!", ", ")
+    text = text.replace("?", ", ")
     
-    # 6. Smart Period Replacement (Ignore 3.5, V2.0)
-    text = re.sub(r'(?<!\d)\.(?!\d)', ' ###STOP### ', text)
+    # 6. Smart Period Replacement (Ignore 3.5 or v2.0)
+    # Regex: Find dot NOT preceded by digit AND NOT followed by digit
+    text = re.sub(r'(?<!\d)\.(?!\d)', ', ', text)
     
     # 7. Restore Protected Words
     for k, v in protected.items():
         original_word = k 
         text = text.replace(v, original_word)
-
+        
+    # 8. Clean up double commas
+    text = text.replace(", ,", ",")
+    text = text.replace(",  ,", ",")
+    
     return text
 
-def split_text_strictly(text, chunk_size):
-    """Splits text ONLY at markers."""
-    if len(text) <= chunk_size:
-        return [text]
+async def generate_audio(text, voice, rate_str, pitch_str, final_filename):
+    """Generates audio in ONE PASS (No splitting)."""
     
-    chunks = []
-    while text:
-        if len(text) <= chunk_size:
-            chunks.append(text)
-            break
-        
-        split_at = -1
-        # Priority 1: Paragraph
-        para_pos = text.rfind('###PARA###', 0, chunk_size)
-        if para_pos != -1:
-            split_at = para_pos + len("###PARA###")
-        else:
-            # Priority 2: Sentence Stop
-            stop_pos = text.rfind('###STOP###', 0, chunk_size)
-            if stop_pos != -1:
-                split_at = stop_pos + len("###STOP###")
-            else:
-                # Emergency Fallback
-                space_pos = text.rfind(' ', 0, chunk_size)
-                split_at = space_pos + 1 if space_pos != -1 else chunk_size
-        
-        chunks.append(text[:split_at])
-        text = text[split_at:]
+    # 1. Process text to enforce fast flow (200ms)
+    final_text = preprocess_text_smart(text)
     
-    return chunks
-
-async def generate_long_audio(text, voice, rate_str, pitch_str, final_filename):
-    """Generates audio with corrected flow."""
-    tagged_text = preprocess_text_with_markers(text)
-    chunks = split_text_strictly(tagged_text, CHUNK_SIZE)
-    merged_audio = b""
-    
-    for i, chunk in enumerate(chunks):
-        if not chunk.strip(): continue
-        
-        # Both STOP and PARA become ", " (Comma) -> 200ms pause
-        final_chunk = chunk.replace("###STOP###", ", ").replace("###PARA###", ", ")
-        
-        # Double check no "Dr, " issues remain
-        final_chunk = final_chunk.replace(", ,", ",")
-        
-        temp_file = f"temp_chunk_{i}_{final_filename}"
-        try:
-            communicate = edge_tts.Communicate(final_chunk, voice, rate=rate_str, pitch=pitch_str)
-            await communicate.save(temp_file)
-            with open(temp_file, "rb") as f:
-                merged_audio += f.read()
-            os.remove(temp_file)
-        except Exception as e:
-            logging.error(f"Chunk error: {e}")
-            if os.path.exists(temp_file): os.remove(temp_file)
-            return False
-
-    with open(final_filename, "wb") as f:
-        f.write(merged_audio)
-    return True
+    try:
+        # 2. Generate directly
+        communicate = edge_tts.Communicate(final_text, voice, rate=rate_str, pitch=pitch_str)
+        await communicate.save(final_filename)
+        return True
+    except Exception as e:
+        logging.error(f"Generation Error: {e}")
+        return False
 
 # --- KEYBOARDS & MENUS ---
 def get_control_keyboard(total_chars):
@@ -286,10 +234,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "generate":
         if not context.user_data.get("text_buffer"): await query.edit_message_text("⚠️ No text."); return
-        await query.edit_message_text("⏳ **Generating...**")
+        await query.edit_message_text("⏳ **Generating...** (One Pass)")
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
 
         try:
+            # JOIN ALL TEXT
             raw_text = "\n".join(context.user_data["text_buffer"])
             voice = context.user_data.get("voice", DEFAULT_VOICE)
             output_file = f"tts_{query.from_user.id}.mp3"
@@ -297,13 +246,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rate, pitch = context.user_data.get("rate", 0), context.user_data.get("pitch", 0)
             rate_str, pitch_str = f"+{rate}%" if rate >=0 else f"{rate}%", f"+{pitch}Hz" if pitch >=0 else f"{pitch}Hz"
 
-            success = await generate_long_audio(raw_text, voice, rate_str, pitch_str, output_file)
+            # ONE PASS GENERATION
+            success = await generate_audio(raw_text, voice, rate_str, pitch_str, output_file)
             if not success: raise Exception("Gen failed")
             
             await context.bot.send_audio(
                 chat_id=update.effective_chat.id,
                 audio=open(output_file, "rb"),
-                caption=f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏩ Smooth Burmese Flow",
+                caption=f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏩ Fast Flow",
                 title="TTS Audio"
             )
             os.remove(output_file)
