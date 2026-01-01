@@ -3,7 +3,7 @@ import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import edge_tts
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     Application,
@@ -87,9 +87,21 @@ def run_web_server():
 # --- HELPER FUNCTIONS ---
 def preprocess_text_for_pauses(text):
     if not text: return ""
-    text = text.replace("။", "။\n") 
+    
+    # 1. Flatten the text: Remove existing newlines to prevent long "Paragraph Pauses" (~800ms+)
+    text = text.replace("\n", " ")
+    
+    # 2. Add a simple space after punctuation. 
+    # Do NOT add \n here. A period + space creates a standard sentence pause (~200-400ms).
+    text = text.replace("။", "။ ") 
     text = text.replace("、", "、 ") 
-    text = text.replace(".", ".\n") 
+    text = text.replace(".", ". ")
+    text = text.replace("?", "? ")
+    text = text.replace("!", "! ")
+    
+    # 3. Collapse multiple spaces into one to avoid accidental silence accumulation
+    text = " ".join(text.split())
+    
     return text
 
 def get_control_keyboard(total_chars):
@@ -113,7 +125,7 @@ def get_settings_markup(data):
         [InlineKeyboardButton("✅ Close Settings", callback_data="close_settings")]
     ])
 
-# --- SHARED MENU FUNCTIONS (WORK FOR BOTH COMMANDS AND BUTTONS) ---
+# --- SHARED MENU FUNCTIONS ---
 async def show_voice_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, is_new_message=False):
     keyboard = [[InlineKeyboardButton(r, callback_data=f"menu_{r}")] for r in VOICES.keys()]
     keyboard.append([InlineKeyboardButton("❌ Close", callback_data="close_settings")])
@@ -137,7 +149,6 @@ async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
 
 # --- COMMAND HANDLERS ---
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data["text_buffer"] = []
@@ -205,7 +216,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
 
         try:
-            raw_text = "\n".join(context.user_data["text_buffer"])
+            # JOIN WITH SPACE, NOT NEWLINE
+            raw_text = " ".join(context.user_data["text_buffer"])
+            
+            # Preprocess (Flatten text)
             final_text = preprocess_text_for_pauses(raw_text)
             
             voice = context.user_data.get("voice", DEFAULT_VOICE)
