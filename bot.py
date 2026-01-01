@@ -1,11 +1,9 @@
 import os
 import logging
-import re
 import threading
-import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import edge_tts
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     Application,
@@ -27,6 +25,11 @@ VOICES = {
         "Andrew (Male)": "en-US-AndrewMultilingualNeural",
         "Emma (Female)": "en-US-EmmaMultilingualNeural",
         "Brian (Male)": "en-US-BrianMultilingualNeural",
+        "Florian (German/Multi)": "de-DE-FlorianMultilingualNeural",
+        "Remy (French/Multi)": "fr-FR-RemyMultilingualNeural",
+        "Giuseppe (Italian/Multi)": "it-IT-GiuseppeMultilingualNeural",
+        "Hyunsu (Korean/Multi)": "ko-KR-HyunsuMultilingualNeural",
+        "William (Australian/Multi)": "en-AU-WilliamMultilingualNeural",
     },
     "🇲🇲 Myanmar": {
         "Thiha (Male)": "my-MM-ThihaNeural",
@@ -45,6 +48,8 @@ VOICES = {
         "Korean (InJoon - M)": "ko-KR-InJoonNeural",
         "Chinese (Xiaoxiao - F)": "zh-CN-XiaoxiaoNeural",
         "Chinese (Yunxi - M)": "zh-CN-YunxiNeural",
+        "Hindi (Swara - F)": "hi-IN-SwaraNeural",
+        "Hindi (Madhur - M)": "hi-IN-MadhurNeural",
     },
     "🇪🇺 Europe": {
         "British (Sonia - F)": "en-GB-SoniaNeural",
@@ -66,7 +71,7 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# --- DUMMY SERVER ---
+# --- DUMMY SERVER (Render Keep-Alive) ---
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -80,68 +85,13 @@ def run_web_server():
     server.serve_forever()
 
 # --- HELPER FUNCTIONS ---
-
-def preprocess_text_smart(text):
-    """
-    1. Protects Abbreviations (Dr., No.) & Decimals (3.5).
-    2. Converts Real Sentences & Paragraphs to commas for fast flow.
-    """
+def preprocess_text_for_pauses(text):
     if not text: return ""
-    
-    # 1. Normalize Newlines
-    text = text.replace('\r\n', '\n').replace('\r', '\n')
-    
-    # 2. Protect Abbreviations & Decimals
-    protected = {
-        "Dr.": "Dr_DOT", "Mr.": "Mr_DOT", "Mrs.": "Mrs_DOT", "Ms.": "Ms_DOT",
-        "No.": "No_DOT", "St.": "St_DOT", "vs.": "vs_DOT", "etc.": "etc_DOT"
-    }
-    for k, v in protected.items():
-        text = text.replace(k, v)
-        text = text.replace(k.lower(), v)
-
-    # 3. Mark Paragraphs (Enter key) -> Convert directly to comma
-    text = text.replace("\n", ", ")
-
-    # 4. Mark Myanmar Punctuation -> Convert directly to comma
-    text = text.replace("။", ", ")
-    text = text.replace("。", ", ")
-    
-    # 5. Mark English Punctuation -> Convert directly to comma
-    text = text.replace("!", ", ")
-    text = text.replace("?", ", ")
-    
-    # 6. Smart Period Replacement (Ignore 3.5 or v2.0)
-    # Regex: Find dot NOT preceded by digit AND NOT followed by digit
-    text = re.sub(r'(?<!\d)\.(?!\d)', ', ', text)
-    
-    # 7. Restore Protected Words
-    for k, v in protected.items():
-        original_word = k 
-        text = text.replace(v, original_word)
-        
-    # 8. Clean up double commas
-    text = text.replace(", ,", ",")
-    text = text.replace(",  ,", ",")
-    
+    text = text.replace("။", "။\n") 
+    text = text.replace("、", "、 ") 
+    text = text.replace(".", ".\n") 
     return text
 
-async def generate_audio(text, voice, rate_str, pitch_str, final_filename):
-    """Generates audio in ONE PASS (No splitting)."""
-    
-    # 1. Process text to enforce fast flow (200ms)
-    final_text = preprocess_text_smart(text)
-    
-    try:
-        # 2. Generate directly
-        communicate = edge_tts.Communicate(final_text, voice, rate=rate_str, pitch=pitch_str)
-        await communicate.save(final_filename)
-        return True
-    except Exception as e:
-        logging.error(f"Generation Error: {e}")
-        return False
-
-# --- KEYBOARDS & MENUS ---
 def get_control_keyboard(total_chars):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"✅ Generate Audio ({total_chars} chars)", callback_data="generate")],
@@ -163,32 +113,51 @@ def get_settings_markup(data):
         [InlineKeyboardButton("✅ Close Settings", callback_data="close_settings")]
     ])
 
-async def show_voice_menu(update, context, is_new_message=False):
+# --- SHARED MENU FUNCTIONS (WORK FOR BOTH COMMANDS AND BUTTONS) ---
+async def show_voice_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, is_new_message=False):
     keyboard = [[InlineKeyboardButton(r, callback_data=f"menu_{r}")] for r in VOICES.keys()]
     keyboard.append([InlineKeyboardButton("❌ Close", callback_data="close_settings")])
     markup = InlineKeyboardMarkup(keyboard)
     text = "🗣 **Select Voice Category:**"
-    if is_new_message: await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
-    else: await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
 
-async def show_settings_menu(update, context, is_new_message=False):
+    if is_new_message:
+        await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+
+async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, is_new_message=False):
     context.user_data.setdefault("rate", 0)
     context.user_data.setdefault("pitch", 0)
     markup = get_settings_markup(context.user_data)
     text = "⚙️ **Audio Settings:**"
-    if is_new_message: await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
-    else: await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
 
-# --- HANDLERS ---
+    if is_new_message:
+        await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+
+# --- COMMAND HANDLERS ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data["text_buffer"] = []
-    context.user_data.setdefault("voice", DEFAULT_VOICE)
-    context.user_data.setdefault("voice_name", "Burmese (Thiha)")
-    await update.message.reply_text("👋 **Bot Restarted!**\n\nSend me text or a .txt file to begin.", parse_mode=ParseMode.MARKDOWN)
+    context.user_data["voice"] = DEFAULT_VOICE
+    context.user_data["voice_name"] = "Burmese (Thiha)"
+    context.user_data["rate"] = 0
+    context.user_data["pitch"] = 0
 
-async def command_voice(update, context): await show_voice_menu(update, context, True)
-async def command_settings(update, context): await show_settings_menu(update, context, True)
+    await update.message.reply_text(
+        "👋 **Bot Restarted!**\n\n"
+        "Send me text to begin.\n"
+        "I have cleared your previous memory.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def command_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_voice_menu(update, context, is_new_message=True)
+
+async def command_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_settings_menu(update, context, is_new_message=True)
 
 async def collect_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -200,70 +169,72 @@ async def collect_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["text_buffer"].append(text)
     total_len = sum(len(t) for t in context.user_data["text_buffer"])
     
-    await update.message.reply_text(f"📥 **Saved.** (Total: {total_len} chars)", reply_markup=get_control_keyboard(total_len), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        f"📥 **Saved.** (Total: {total_len} chars)",
+        reply_markup=get_control_keyboard(total_len),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-async def handle_txt_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file = await update.message.document.get_file()
-    if update.message.document.file_size > 5 * 1024 * 1024:
-        await update.message.reply_text("⚠️ File too large.")
-        return
-    file_bytes = await file.download_as_bytearray()
-    try: text_content = file_bytes.decode('utf-8')
-    except: text_content = file_bytes.decode('cp1252', errors='ignore')
-
-    if not text_content.strip(): return
-    if "text_buffer" not in context.user_data:
-        context.user_data["text_buffer"] = []
-        context.user_data.setdefault("voice", DEFAULT_VOICE)
-        context.user_data.setdefault("voice_name", "Burmese (Thiha)")
-
-    context.user_data["text_buffer"].append(text_content)
-    await update.message.reply_text(f"📄 **File Read.**\nTotal: {sum(len(t) for t in context.user_data['text_buffer'])} chars", reply_markup=get_control_keyboard(len(text_content)), parse_mode=ParseMode.MARKDOWN)
-
+# --- BUTTON HANDLER (CLICKS) ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    if data == "open_voice_menu": await show_voice_menu(update, context, False); return
-    if data == "open_settings": await show_settings_menu(update, context, False); return
+    # --- 1. MENUS ---
+    if data == "open_voice_menu":
+        await show_voice_menu(update, context, is_new_message=False)
+        return
+
+    if data == "open_settings":
+        await show_settings_menu(update, context, is_new_message=False)
+        return
+
+    # --- 2. GENERATE & CLEAR ---
     if data == "clear_buffer":
         context.user_data["text_buffer"] = []
-        await query.edit_message_text("🗑 **Memory Cleared.**")
+        await query.edit_message_text("🗑 **Memory Cleared.** Send new text.")
         return
 
     if data == "generate":
-        if not context.user_data.get("text_buffer"): await query.edit_message_text("⚠️ No text."); return
-        await query.edit_message_text("⏳ **Generating...** (One Pass)")
+        if not context.user_data.get("text_buffer"):
+            await query.edit_message_text("⚠️ No text found. Send text first.")
+            return
+
+        await query.edit_message_text("⏳ **Generating...**")
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
 
         try:
-            # JOIN ALL TEXT
             raw_text = "\n".join(context.user_data["text_buffer"])
+            final_text = preprocess_text_for_pauses(raw_text)
+            
             voice = context.user_data.get("voice", DEFAULT_VOICE)
-            output_file = f"tts_{query.from_user.id}.mp3"
+            rate = context.user_data.get("rate", 0)
+            pitch = context.user_data.get("pitch", 0)
             
-            rate, pitch = context.user_data.get("rate", 0), context.user_data.get("pitch", 0)
-            rate_str, pitch_str = f"+{rate}%" if rate >=0 else f"{rate}%", f"+{pitch}Hz" if pitch >=0 else f"{pitch}Hz"
+            rate_str = f"+{rate}%" if rate >= 0 else f"{rate}%"
+            pitch_str = f"+{pitch}Hz" if pitch >= 0 else f"{pitch}Hz"
 
-            # ONE PASS GENERATION
-            success = await generate_audio(raw_text, voice, rate_str, pitch_str, output_file)
-            if not success: raise Exception("Gen failed")
-            
+            output_file = f"tts_{query.from_user.id}.mp3"
+            communicate = edge_tts.Communicate(final_text, voice, rate=rate_str, pitch=pitch_str)
+            await communicate.save(output_file)
+
             await context.bot.send_audio(
                 chat_id=update.effective_chat.id,
                 audio=open(output_file, "rb"),
-                caption=f"🗣 {context.user_data.get('voice_name')}\n⚡ {rate_str} | 🎵 {pitch_str} | ⏩ Fast Flow",
+                caption=f"🗣 {context.user_data.get('voice_name', 'Unknown')}\n⚡ {rate_str} | 🎵 {pitch_str}",
                 title="TTS Audio"
             )
             os.remove(output_file)
-            context.user_data["text_buffer"] = []
-            await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Done!")
+            context.user_data["text_buffer"] = [] 
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Done! Send new text.")
+
         except Exception as e:
             logging.error(f"TTS Error: {e}")
-            await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Error.")
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Error generating audio.")
         return
 
+    # --- 3. VOICE NAVIGATION ---
     if data.startswith("menu_"):
         region = data.replace("menu_", "")
         keyboard = [[InlineKeyboardButton(n, callback_data=f"set_{c}|{n}")] for n, c in VOICES[region].items()]
@@ -271,15 +242,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"📂 **{region}**", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
+    # --- 4. VOICE SELECTION ---
     if data.startswith("set_"):
         code, name = data.replace("set_", "").split("|")
-        context.user_data["voice"], context.user_data["voice_name"] = code, name
-        await query.edit_message_text(f"✅ Set to: **{name}**", reply_markup=get_control_keyboard(sum(len(t) for t in context.user_data.get("text_buffer", []))), parse_mode=ParseMode.MARKDOWN)
+        context.user_data["voice"] = code
+        context.user_data["voice_name"] = name
+        
+        # Sample
+        await query.edit_message_text(f"⏳ Loading sample for **{name}**...", parse_mode=ParseMode.MARKDOWN)
+        sample_file = f"sample_{query.from_user.id}.mp3"
+        try:
+            await edge_tts.Communicate("Hello.", code).save(sample_file)
+            await context.bot.send_voice(chat_id=update.effective_chat.id, voice=open(sample_file, "rb"))
+            os.remove(sample_file)
+        except: pass
+
+        total = sum(len(t) for t in context.user_data.get("text_buffer", []))
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"✅ Voice set to: **{name}**",
+            reply_markup=get_control_keyboard(total)
+        )
+        return
+
+    # --- 5. SETTINGS ---
+    if data == "close_settings":
+        total = sum(len(t) for t in context.user_data.get("text_buffer", []))
+        if total > 0:
+            await query.edit_message_text(f"📥 **Ready.** (Total: {total} chars)", reply_markup=get_control_keyboard(total), parse_mode=ParseMode.MARKDOWN)
+        else:
+            await query.delete_message()
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Settings closed.")
         return
 
     if "rate_" in data or "pitch_" in data:
         key, val = data.split("_")
-        context.user_data[key] = max(-100, min(100, context.user_data.get(key, 0) + int(val)))
+        val = int(val)
+        current = context.user_data.get(key, 0)
+        context.user_data[key] = max(-100, min(100, current + val))
         await query.edit_message_reply_markup(get_settings_markup(context.user_data))
         return
 
@@ -287,26 +287,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.update({"rate": 10, "pitch": 5})
         await query.edit_message_reply_markup(get_settings_markup(context.user_data))
         return
+
     if data == "preset_reset":
         context.user_data.update({"rate": 0, "pitch": 0})
         await query.edit_message_reply_markup(get_settings_markup(context.user_data))
         return
-    if data == "close_settings":
-        await query.delete_message()
-        return
 
+# --- INIT ---
 async def post_init(application: Application):
-    await application.bot.set_my_commands([("start", "Reset"), ("voice", "Voices"), ("settings", "Settings")])
+    commands = [
+        ("start", "Restart Bot"),
+        ("voice", "Change Speaker"),
+        ("settings", "Speed & Pitch"),
+    ]
+    await application.bot.set_my_commands(commands)
 
 def main():
-    if not TOKEN: print("❌ TELEGRAM_TOKEN missing"); return
+    if not TOKEN:
+        print("❌ TELEGRAM_TOKEN missing")
+        return
+
     application = Application.builder().token(TOKEN).post_init(post_init).build()
+
+    # Commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("voice", command_voice))
     application.add_handler(CommandHandler("settings", command_settings))
+    
+    # Messages & Buttons
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_text))
-    application.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_txt_file))
     application.add_handler(CallbackQueryHandler(button_handler))
+
     print("🤖 Bot is starting...")
     application.run_polling()
 
