@@ -87,31 +87,10 @@ def run_web_server():
 # --- HELPER FUNCTIONS ---
 def preprocess_text_for_pauses(text):
     if not text: return ""
-    
-    # Replace newlines with comma + space to avoid long "paragraph" pauses
-    text = text.replace("\n", ", ")
-    
-    # Replace Burmese Full Stop with Comma
-    text = text.replace("။", ", ") 
-    
-    # Replace English Full Stop with Comma
-    text = text.replace(".", ", ")
-    
-    # Replace Exclamation with Comma (to keep timing short)
-    text = text.replace("!", ", ")
-    
-    # Handle Japanese comma if present
-    text = text.replace("、", ", ")
-
-    # Clean up double commas/spaces that might result from replacements
-    while "  " in text:
-        text = text.replace("  ", " ")
-    while ", ," in text:
-        text = text.replace(", ,", ", ")
-    while ",," in text:
-        text = text.replace(",,", ",")
-        
-    return text.strip()
+    text = text.replace("။", "။\n") 
+    text = text.replace("、", "、 ") 
+    text = text.replace(".", ".\n") 
+    return text
 
 def get_control_keyboard(total_chars):
     return InlineKeyboardMarkup([
@@ -226,8 +205,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
 
         try:
-            # Join with comma to prevent line-break pauses
-            raw_text = ", ".join(context.user_data["text_buffer"])
+            raw_text = "\n".join(context.user_data["text_buffer"])
             final_text = preprocess_text_for_pauses(raw_text)
             
             voice = context.user_data.get("voice", DEFAULT_VOICE)
@@ -274,7 +252,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"⏳ Loading sample for **{name}**...", parse_mode=ParseMode.MARKDOWN)
         sample_file = f"sample_{query.from_user.id}.mp3"
         try:
-            await edge_tts.Communicate("မင်္ဂလာပါ။ ဒါကအသံ Sample ပါ။ Hello.", code).save(sample_file)
+            await edge_tts.Communicate("မင်္ဂလာပါ Hello.", code).save(sample_file)
             await context.bot.send_voice(chat_id=update.effective_chat.id, voice=open(sample_file, "rb"))
             os.remove(sample_file)
         except: pass
