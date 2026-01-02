@@ -274,7 +274,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"⏳ Loading sample for **{name}**...", parse_mode=ParseMode.MARKDOWN)
         sample_file = f"sample_{query.from_user.id}.mp3"
         try:
-            await edge_tts.Communicate("Hello.", code).save(sample_file)
+            await edge_tts.Communicate("မင်္ဂလာပါ။ ဒါကအသံ Sample ပါ။ Hello.", code).save(sample_file)
             await context.bot.send_voice(chat_id=update.effective_chat.id, voice=open(sample_file, "rb"))
             os.remove(sample_file)
         except: pass
