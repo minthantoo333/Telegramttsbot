@@ -113,7 +113,7 @@ def get_settings_markup(data):
         [InlineKeyboardButton("✅ Close Settings", callback_data="close_settings")]
     ])
 
-# --- SHARED MENU FUNCTIONS (WORK FOR BOTH COMMANDS AND BUTTONS) ---
+# --- SHARED MENU FUNCTIONS ---
 async def show_voice_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, is_new_message=False):
     keyboard = [[InlineKeyboardButton(r, callback_data=f"menu_{r}")] for r in VOICES.keys()]
     keyboard.append([InlineKeyboardButton("❌ Close", callback_data="close_settings")])
@@ -148,7 +148,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "👋 **Bot Restarted!**\n\n"
-        "Send me text to begin.\n"
+        "Send me text OR upload a `.txt` file to begin.\n"
         "I have cleared your previous memory.",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -170,10 +170,42 @@ async def collect_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_len = sum(len(t) for t in context.user_data["text_buffer"])
     
     await update.message.reply_text(
-        f"📥 **Saved.** (Total: {total_len} chars)",
+        f"📥 **Saved Text.** (Total: {total_len} chars)",
         reply_markup=get_control_keyboard(total_len),
         parse_mode=ParseMode.MARKDOWN
     )
+
+# --- NEW: FILE HANDLER ---
+async def collect_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    document = update.message.document
+    
+    # Check if user data is initialized (in case file is the very first message)
+    if "text_buffer" not in context.user_data:
+        context.user_data["text_buffer"] = []
+        context.user_data.setdefault("voice", DEFAULT_VOICE)
+        context.user_data.setdefault("voice_name", "Burmese (Thiha)")
+
+    try:
+        # Download file to memory
+        file_info = await document.get_file()
+        byte_data = await file_info.download_as_bytearray()
+        
+        # Decode bytes to string (assuming UTF-8)
+        text_content = byte_data.decode('utf-8')
+        
+        context.user_data["text_buffer"].append(text_content)
+        total_len = sum(len(t) for t in context.user_data["text_buffer"])
+        
+        await update.message.reply_text(
+            f"📄 **File Loaded.** (Total: {total_len} chars)",
+            reply_markup=get_control_keyboard(total_len),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except UnicodeDecodeError:
+        await update.message.reply_text("❌ Error: Please ensure the .txt file is encoded in UTF-8.")
+    except Exception as e:
+        logging.error(f"File Error: {e}")
+        await update.message.reply_text("❌ Failed to process the file.")
 
 # --- BUTTON HANDLER (CLICKS) ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -252,7 +284,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"⏳ Loading sample for **{name}**...", parse_mode=ParseMode.MARKDOWN)
         sample_file = f"sample_{query.from_user.id}.mp3"
         try:
-            await edge_tts.Communicate("Hello.", code).save(sample_file)
+            await edge_tts.Communicate("မင်္ဂလာပါ (Mingalarbar) Hello, This is a test.", code).save(sample_file)
             await context.bot.send_voice(chat_id=update.effective_chat.id, voice=open(sample_file, "rb"))
             os.remove(sample_file)
         except: pass
@@ -314,8 +346,12 @@ def main():
     application.add_handler(CommandHandler("voice", command_voice))
     application.add_handler(CommandHandler("settings", command_settings))
     
-    # Messages & Buttons
+    # Messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_text))
+    # Files (.txt only)
+    application.add_handler(MessageHandler(filters.Document.FileExtension("txt"), collect_file))
+    
+    # Buttons
     application.add_handler(CallbackQueryHandler(button_handler))
 
     print("🤖 Bot is starting...")
