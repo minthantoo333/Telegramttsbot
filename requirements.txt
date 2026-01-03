@@ -1,5 +1,2 @@
 python-telegram-bot
 edge-tts
-pydub
-pyaudio
-audioop-lts
