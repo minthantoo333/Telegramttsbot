@@ -33,7 +33,7 @@ VOICES = {
     },
     "🇲🇲 Myanmar": {
         "Thiha (Male)": "my-MM-ThihaNeural",
-        "Nular (Female)": "my-MM-NularNeural",
+        "Nilar (Female)": "my-MM-NilarNeural",
     },
     "🌏 Asia": {
         "Thai (Premwadee - F)": "th-TH-PremwadeeNeural",
