@@ -16,7 +16,8 @@ from telegram.ext import (
 
 # --- CONFIGURATION ---
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-DEFAULT_VOICE = "my-MM-ThihaNeural"
+# Default to Male (Thiha) - You can change to Nilar if you prefer female default
+DEFAULT_VOICE = "my-MM-ThihaNeural" 
 
 # --- FULL VOICE DATABASE ---
 VOICES = {
@@ -87,10 +88,13 @@ def run_web_server():
 # --- HELPER FUNCTIONS ---
 def preprocess_text_for_pauses(text):
     if not text: return ""
-    text = text.replace("။", "။\n") 
+    # ✅ FIX: Removed \n (newlines) to prevent robotic pauses.
+    # We only add spaces to ensure words don't stick together.
+    text = text.replace("။", "။ ") 
     text = text.replace("、", "、 ") 
-    text = text.replace(".", ".\n") 
-    return text
+    text = text.replace(".", ". ") 
+    # Clean up double spaces
+    return " ".join(text.split())
 
 def get_control_keyboard(total_chars):
     return InlineKeyboardMarkup([
@@ -101,7 +105,7 @@ def get_control_keyboard(total_chars):
     ])
 
 def get_settings_markup(data):
-    speed = data.get("rate", 0)
+    speed = data.get("rate", 10)
     pitch = data.get("pitch", 0)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🐢 Slower", callback_data="rate_-10"),
@@ -126,7 +130,8 @@ async def show_voice_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, is
         await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
 
 async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, is_new_message=False):
-    context.user_data.setdefault("rate", 0)
+    # Default to +10 speed if not set
+    context.user_data.setdefault("rate", 10)
     context.user_data.setdefault("pitch", 0)
     markup = get_settings_markup(context.user_data)
     text = "⚙️ **Audio Settings:**"
@@ -143,13 +148,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["text_buffer"] = []
     context.user_data["voice"] = DEFAULT_VOICE
     context.user_data["voice_name"] = "Burmese (Thiha)"
-    context.user_data["rate"] = 0
+    # ✅ FIX: Default Rate set to +10% for better flow
+    context.user_data["rate"] = 10 
     context.user_data["pitch"] = 0
 
     await update.message.reply_text(
         "👋 **Bot Restarted!**\n\n"
         "Send me text OR upload a `.txt` file to begin.\n"
-        "I have cleared your previous memory.",
+        "I have cleared your previous memory.\n"
+        "⚡ *Default Speed: +10% (Natural Flow)*",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -165,6 +172,8 @@ async def collect_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["text_buffer"] = []
         context.user_data.setdefault("voice", DEFAULT_VOICE)
         context.user_data.setdefault("voice_name", "Burmese (Thiha)")
+        context.user_data.setdefault("rate", 10) # Default +10
+        context.user_data.setdefault("pitch", 0)
 
     context.user_data["text_buffer"].append(text)
     total_len = sum(len(t) for t in context.user_data["text_buffer"])
@@ -175,18 +184,18 @@ async def collect_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN
     )
 
-# --- NEW: FILE HANDLER ---
+# --- FILE HANDLER ---
 async def collect_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
     
-    # Check if user data is initialized (in case file is the very first message)
     if "text_buffer" not in context.user_data:
         context.user_data["text_buffer"] = []
         context.user_data.setdefault("voice", DEFAULT_VOICE)
         context.user_data.setdefault("voice_name", "Burmese (Thiha)")
+        context.user_data.setdefault("rate", 10) # Default +10
+        context.user_data.setdefault("pitch", 0)
 
     try:
-        # Download file to memory
         file_info = await document.get_file()
         byte_data = await file_info.download_as_bytearray()
         
@@ -238,10 +247,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             raw_text = "\n".join(context.user_data["text_buffer"])
+            # ✅ Process text (No forced newlines)
             final_text = preprocess_text_for_pauses(raw_text)
             
             voice = context.user_data.get("voice", DEFAULT_VOICE)
-            rate = context.user_data.get("rate", 0)
+            # Default to +10 if missing
+            rate = context.user_data.get("rate", 10) 
             pitch = context.user_data.get("pitch", 0)
             
             rate_str = f"+{rate}%" if rate >= 0 else f"{rate}%"
@@ -284,7 +295,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"⏳ Loading sample for **{name}**...", parse_mode=ParseMode.MARKDOWN)
         sample_file = f"sample_{query.from_user.id}.mp3"
         try:
-            await edge_tts.Communicate("မင်္ဂလာပါ (Mingalarbar) Hello, This is a test.", code).save(sample_file)
+            # Generate sample with neutral speed/pitch
+            await edge_tts.Communicate("Hello, this is a voice test.", code).save(sample_file)
             await context.bot.send_voice(chat_id=update.effective_chat.id, voice=open(sample_file, "rb"))
             os.remove(sample_file)
         except: pass
@@ -310,18 +322,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "rate_" in data or "pitch_" in data:
         key, val = data.split("_")
         val = int(val)
-        current = context.user_data.get(key, 0)
+        # Default rate fallback to 10 if not present
+        current = context.user_data.get(key, 10 if key == "rate" else 0)
         context.user_data[key] = max(-100, min(100, current + val))
         await query.edit_message_reply_markup(get_settings_markup(context.user_data))
         return
 
     if data == "preset_crisp":
-        context.user_data.update({"rate": 10, "pitch": 5})
+        # Crisp preset slightly faster + slightly higher pitch
+        context.user_data.update({"rate": 15, "pitch": 5})
         await query.edit_message_reply_markup(get_settings_markup(context.user_data))
         return
 
     if data == "preset_reset":
-        context.user_data.update({"rate": 0, "pitch": 0})
+        # Reset to our new "Natural" default
+        context.user_data.update({"rate": 10, "pitch": 0})
         await query.edit_message_reply_markup(get_settings_markup(context.user_data))
         return
 
